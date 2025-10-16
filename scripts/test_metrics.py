@@ -33,9 +33,11 @@ def generate_synthetic_data(
     # Add class-specific signal
     for c in range(num_classes):
         mask = labels == c
-        # Make certain dimensions more active for this class
-        class_features = torch.arange(c * 10, (c + 1) * 10)
-        activations[mask, class_features] += 2.0
+        # Define feature range for this class
+        feature_start = c * 10
+        feature_end = min((c + 1) * 10, hidden_dim)
+        # Boolean mask + slice indexing works correctly in PyTorch
+        activations[mask, feature_start:feature_end] += 2.0
     
     # Add some sparsity
     activations = torch.relu(activations)
@@ -148,8 +150,9 @@ def test_comparison_across_conditions():
     good_acts = torch.randn(n_samples, hidden_dim)
     for c in range(num_classes):
         mask = labels == c
-        class_features = torch.arange(c * 10, (c + 1) * 10)
-        good_acts[mask, class_features] += 5.0  # Strong signal
+        feature_start = c * 10
+        feature_end = min((c + 1) * 10, hidden_dim)
+        good_acts[mask, feature_start:feature_end] += 5.0  # Strong signal
     good_acts = torch.relu(good_acts)
     
     # Bad representation: no class structure

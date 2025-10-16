@@ -65,7 +65,14 @@ class PerClassSharpener(FeatureSharpener):
             mask = labels == label
             top_k_indices = top_k_per_class[label.item()].to(sparse_code.device)
             
-            # Keep only top-k features for this class
-            sharpened[mask, top_k_indices] = sparse_code[mask, top_k_indices]
+            # Get row indices where this class appears
+            row_indices = torch.where(mask)[0]
+            
+            # Use advanced indexing with broadcasting
+            # row_indices: [N_class]
+            # top_k_indices: [k]
+            # Need to broadcast to [N_class, k]
+            sharpened[row_indices[:, None], top_k_indices[None, :]] = \
+                sparse_code[row_indices[:, None], top_k_indices[None, :]]
         
         return sharpened
