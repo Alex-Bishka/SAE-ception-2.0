@@ -1,0 +1,27 @@
+defaults:
+  - dataset: sst2
+  - model: gpt2_small
+  - sae: default
+  - sharpening: per_class
+  - _self_
+
+# Experiment tracking
+wandb:
+  project: sae-ception
+  entity: null  # Set your wandb entity
+  mode: online  # or 'disabled' for testing
+
+# Training
+seed: 42
+device: cuda
+
+# Paths
+output_dir: ${hydra:runtime.output_dir}
+checkpoint_dir: ${output_dir}/checkpoints
+data_cache_dir: ./data_cache
+
+# SAE-ception cycle parameters
+cycle:
+  current: 0
+  max_cycles: 3
+  aux_loss_weight: 0.01  # λ parameter

@@ -1,0 +1,16 @@
+name: ag_news
+hf_path: ag_news
+hf_name: null
+num_classes: 4
+
+# For classification head
+text_column: text
+label_column: label
+
+# Training parameters
+batch_size: 32
+max_length: 256
+num_workers: 4
+
+# Validation split
+validation_split: 0.1

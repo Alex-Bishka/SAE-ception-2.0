@@ -1,0 +1,84 @@
+# SAE-ception
+
+Iterative training method that uses Sparse Autoencoders (SAEs) to improve model interpretability.
+
+## Setup
+```bash
+# Install UV if you haven't already
+curl -LsSf https://astral.sh/uv/install.sh | sh
+
+# Create virtual environment and install dependencies
+uv venv
+source .venv/bin/activate  # On Windows: .venv\Scripts\activate
+uv pip install -e .
+```
+
+## Quick Start
+
+### Train Baseline Model (Cycle 0)
+```bash
+python scripts/train_cycle.py
+```
+
+### Run First SAE-ception Cycle
+```bash
+python scripts/train_cycle.py cycle.current=1
+```
+
+### Try Different Sharpening Strategies
+```bash
+# Per-class (default)
+python scripts/train_cycle.py sharpening=per_class
+
+# Per-example
+python scripts/train_cycle.py sharpening=per_example
+
+# Random baseline
+python scripts/train_cycle.py sharpening=random
+```
+
+### Use Different Datasets
+```bash
+python scripts/train_cycle.py dataset=ag_news
+```
+
+## Project Structure
+```
+sae-ception/
+├── configs/          # Hydra configuration files
+├── src/              # Source code
+│   └── sae_ception/
+│       ├── models/       # SAE architecture
+│       ├── training/     # Training loops
+│       ├── sharpening/   # Feature sharpening strategies
+│       ├── evaluation/   # Metrics and evaluation
+│       └── utils/        # Utilities
+├── scripts/          # Executable scripts
+└── outputs/          # Experiment outputs (created by Hydra)
+```
+
+## Configuration
+
+All experiments are configured via Hydra YAML files in `configs/`. Key configuration groups:
+
+- `dataset/`: Dataset configuration (sst2, ag_news)
+- `model/`: Model configuration (gpt2_small, gpt_neox_20b)
+- `sae/`: SAE hyperparameters
+- `sharpening/`: Feature sharpening strategy
+- `experiment/`: Pre-configured experiment setups
+
+## Development
+```bash
+# Install dev dependencies
+uv pip install -e ".[dev]"
+
+# Format code
+black src/ scripts/
+
+# Lint
+ruff check src/ scripts/
+```
+
+## Citation
+
+Based on "SAE-ception: Iteratively Using Sparse Autoencoders as a Training Signal"

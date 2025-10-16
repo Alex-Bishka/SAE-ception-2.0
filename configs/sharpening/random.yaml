@@ -1,0 +1,3 @@
+_target_: sae_ception.sharpening.random.RandomSharpener
+type: random
+seed: 42

@@ -1,0 +1,3 @@
+_target_: sae_ception.sharpening.per_class.PerClassSharpener
+type: per_class
+top_k: 25

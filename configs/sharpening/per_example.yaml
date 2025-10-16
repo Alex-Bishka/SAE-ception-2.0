@@ -1,0 +1,3 @@
+_target_: sae_ception.sharpening.per_example.PerExampleSharpener
+type: per_example
+top_k: 25

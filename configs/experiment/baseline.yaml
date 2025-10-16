@@ -1,0 +1,9 @@
+# @package _global_
+
+# Baseline training (cycle 0)
+cycle:
+  current: 0
+  max_cycles: 0  # Don't continue after baseline
+
+wandb:
+  tags: [baseline]
