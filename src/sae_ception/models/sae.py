@@ -10,7 +10,7 @@ class SparseAutoencoder(nn.Module):
         self,
         input_dim: int,
         hidden_dim: int,
-        l1_penalty: float = 2e-4,
+        l1_penalty: float = 1e-4,
     ):
         super().__init__()
         self.input_dim = input_dim
