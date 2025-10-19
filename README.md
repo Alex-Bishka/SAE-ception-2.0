@@ -1,6 +1,6 @@
 # SAE-ception
 
-Iterative training method that uses Sparse Autoencoders (SAEs) to improve model interpretability.
+Iterative training method that uses Sparse Autoencoders (SAEs) to improve model interpretability. Follow up to the original [SAE-ception](https://github.com/Alex-Bishka/SAE-ception).
 
 ## Setup
 ```bash
