@@ -67,13 +67,34 @@ def register_activation_hook(
     # Handle negative indices for layer names
     if layer_name.lstrip('-').isdigit():
         layer_idx = int(layer_name)
-        # For transformers, typically model.transformer.h is the layer list
+        
+        # Try different common transformer architectures
+        layers = None
+        
+        # Option 1: model.transformer.h (GPT2ForSequenceClassification)
         if hasattr(model, 'transformer') and hasattr(model.transformer, 'h'):
             layers = model.transformer.h
-            target_layer = layers[layer_idx]
-            hook_name = f"layer_{layer_idx}"
-        else:
-            raise ValueError(f"Cannot handle layer index {layer_idx} for this model type")
+        # Option 2: model.h (GPT2Model, already unwrapped transformer)
+        elif hasattr(model, 'h'):
+            layers = model.h
+        # Option 3: model.layers (some other architectures)
+        elif hasattr(model, 'layers'):
+            layers = model.layers
+        # Option 4: model.encoder.layer (BERT-style)
+        elif hasattr(model, 'encoder') and hasattr(model.encoder, 'layer'):
+            layers = model.encoder.layer
+        # Option 5: model.gpt_neox.layers (GPT-NeoX)
+        elif hasattr(model, 'gpt_neox') and hasattr(model.gpt_neox, 'layers'):
+            layers = model.gpt_neox.layers
+        
+        if layers is None:
+            raise ValueError(
+                f"Cannot find layer list for model type {type(model).__name__}. "
+                f"Model attributes: {list(model.__dict__.keys())}"
+            )
+        
+        target_layer = layers[layer_idx]
+        hook_name = f"layer_{layer_idx}"
     else:
         # Handle named layers
         target_layer = dict(model.named_modules())[layer_name]

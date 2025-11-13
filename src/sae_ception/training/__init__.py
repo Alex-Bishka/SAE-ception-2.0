@@ -8,4 +8,5 @@ __all__ = [
     'load_baseline_model',
     'train_sae',
     'load_sae',
+    'train_with_auxiliary_loss',
 ]

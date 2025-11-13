@@ -79,6 +79,27 @@ black src/ scripts/
 ruff check src/ scripts/
 ```
 
+## Creating a Job
+
+To make a lean run dir on the cluster:
+```
+mkdir -p /home1/$USER/jobs/saeception-run
+
+rsync -av \
+  --exclude '.venv' --exclude '.git' --exclude '.cache' \
+  --exclude 'data' --exclude 'outputs' --exclude 'wandb' \
+  /home1/$USER/SAE-ception/ /home1/$USER/jobs/saeception-run/
+```
+
+
+Submit job from login node:
+```
+cd /home1/$USER/jobs/saeception-run/
+sbatch run.sbatch
+squeue -u $USER
+tail -f slurm-<jobid>.out
+```
+
 ## Citation
 
 Based on "SAE-ception: Iteratively Using Sparse Autoencoders as a Training Signal"
