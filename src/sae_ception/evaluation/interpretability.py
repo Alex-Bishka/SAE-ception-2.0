@@ -222,7 +222,7 @@ def evaluate_sae_quality(
     device: str = 'cuda',
 ) -> Dict[str, float]:
     """
-    Evaluate SAE reconstruction quality.
+    Evaluate SAE reconstruction quality and feature statistics.
     
     Args:
         sae: Trained SAE
@@ -234,6 +234,8 @@ def evaluate_sae_quality(
             - reconstruction_loss: MSE between input and reconstruction
             - explained_variance: Proportion of variance explained
             - mean_l0: Average sparsity of codes
+            - dead_features_pct: Percentage of features that never activate
+            - feature_usage_entropy: Entropy of feature usage distribution (in nats)
     """
     sae.eval()
     sae.to(device)
@@ -241,6 +243,7 @@ def evaluate_sae_quality(
     all_recon_loss = []
     all_explained_var = []
     all_l0 = []
+    all_sparse_codes = []
     
     # Process in batches to avoid memory issues
     batch_size = 256
@@ -264,9 +267,37 @@ def evaluate_sae_quality(
             # Sparsity (L0)
             l0 = (sparse_code > 0).float().sum(dim=-1).mean()
             all_l0.append(l0.item())
+            
+            # Collect sparse codes for feature statistics
+            all_sparse_codes.append(sparse_code.cpu())
+    
+    # Concatenate all sparse codes
+    all_sparse_codes = torch.cat(all_sparse_codes, dim=0)  # [N, hidden_dim]
+    
+    # Compute dead features percentage
+    # A feature is "dead" if it never fires (always zero) across the entire dataset
+    feature_ever_active = (all_sparse_codes > 0).any(dim=0)  # [hidden_dim]
+    dead_features_pct = 100.0 * (~feature_ever_active).float().mean().item()
+    
+    # Compute feature usage entropy
+    # How evenly are features being used?
+    feature_fire_counts = (all_sparse_codes > 0).float().sum(dim=0)  # [hidden_dim]
+    total_fires = feature_fire_counts.sum()
+    
+    if total_fires > 0:
+        # Normalize to get probability distribution
+        feature_usage_probs = feature_fire_counts / total_fires
+        # Remove zeros to avoid log(0)
+        feature_usage_probs = feature_usage_probs[feature_usage_probs > 0]
+        # Compute entropy (in nats)
+        feature_usage_entropy = -(feature_usage_probs * torch.log(feature_usage_probs)).sum().item()
+    else:
+        feature_usage_entropy = 0.0
     
     return {
         'reconstruction_loss': float(np.mean(all_recon_loss)),
         'explained_variance': float(np.mean(all_explained_var)),
         'mean_l0': float(np.mean(all_l0)),
+        'dead_features_pct': float(dead_features_pct),
+        'feature_usage_entropy': float(feature_usage_entropy),
     }

@@ -11,7 +11,7 @@ class PerClassSharpener(FeatureSharpener):
         dataloader: torch.utils.data.DataLoader,
         device: str = "cuda",
     ) -> dict:
-        """Identify top-k features for each class."""
+        """Identify top-k% features for each class."""
         sae.eval()
         
         # Accumulate activations per class
@@ -40,15 +40,22 @@ class PerClassSharpener(FeatureSharpener):
                     class_activations[label_item] += sparse_codes[mask].sum(dim=0)
                     class_counts[label_item] += mask.sum().item()
         
-        # Compute mean activations and get top-k indices per class
+        # Compute mean activations and get top-k% indices per class
+        hidden_dim = next(iter(class_activations.values())).shape[0]
+        k = self._compute_k(hidden_dim)
+        
         top_k_per_class = {}
         
         for label, activations in class_activations.items():
             mean_activation = activations / class_counts[label]
-            top_k_indices = torch.topk(mean_activation, k=self.top_k).indices
+            top_k_indices = torch.topk(mean_activation, k=k).indices
             top_k_per_class[label] = top_k_indices.cpu()
         
-        return {"top_k_per_class": top_k_per_class}
+        return {
+            "top_k_per_class": top_k_per_class,
+            "k": k,
+            "top_k_pct": self.top_k_pct,
+        }
     
     def sharpen_features(
         self,
@@ -56,7 +63,7 @@ class PerClassSharpener(FeatureSharpener):
         labels: torch.Tensor,
         salient_features: dict,
     ) -> torch.Tensor:
-        """Zero out all but top-k features for each sample's class."""
+        """Zero out all but top-k% features for each sample's class."""
         top_k_per_class = salient_features["top_k_per_class"]
         
         sharpened = torch.zeros_like(sparse_code)
@@ -69,9 +76,6 @@ class PerClassSharpener(FeatureSharpener):
             row_indices = torch.where(mask)[0]
             
             # Use advanced indexing with broadcasting
-            # row_indices: [N_class]
-            # top_k_indices: [k]
-            # Need to broadcast to [N_class, k]
             sharpened[row_indices[:, None], top_k_indices[None, :]] = \
                 sparse_code[row_indices[:, None], top_k_indices[None, :]]
         

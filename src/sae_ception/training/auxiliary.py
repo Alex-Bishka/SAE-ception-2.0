@@ -198,15 +198,28 @@ def train_with_auxiliary_loss(
     if baseline_checkpoint:
         model = load_baseline_model(cfg, checkpoint_path=baseline_checkpoint)
     else:
-        # Auto-find checkpoint
-        outputs_dir = Path('outputs')
-        checkpoint_pattern = f"**/checkpoints/model_cycle_{prev_cycle}_best.pt"
-        checkpoints = sorted(outputs_dir.glob(checkpoint_pattern), key=lambda p: p.stat().st_mtime, reverse=True)
-        if checkpoints:
-            model = load_baseline_model(cfg, checkpoint_path=str(checkpoints[0]))
+        # First try current run's checkpoint directory (for multirun)
+        checkpoint_dir = Path(cfg.checkpoint_dir)
+        checkpoint_path = checkpoint_dir / f"model_cycle_{prev_cycle}_best.pt"
+        
+        if checkpoint_path.exists():
+            logger.info(f"Found checkpoint in current run dir: {checkpoint_path}")
+            model = load_baseline_model(cfg, checkpoint_path=str(checkpoint_path))
         else:
-            raise FileNotFoundError(f"No model checkpoint found for cycle {prev_cycle}")
-    
+            # Fallback: search in outputs/ (for single runs)
+            logger.info(f"Checkpoint not in {checkpoint_dir}, searching outputs/...")
+            outputs_dir = Path('outputs')
+            checkpoint_pattern = f"**/checkpoints/model_cycle_{prev_cycle}_best.pt"
+            checkpoints = sorted(outputs_dir.glob(checkpoint_pattern), 
+                               key=lambda p: p.stat().st_mtime, reverse=True)
+            if checkpoints:
+                logger.info(f"Found checkpoint: {checkpoints[0]}")
+                model = load_baseline_model(cfg, checkpoint_path=str(checkpoints[0]))
+            else:
+                raise FileNotFoundError(
+                    f"No model checkpoint found for cycle {prev_cycle}. "
+                    f"Searched: {checkpoint_dir} and {outputs_dir}"
+                )
     model.to(device)
     
     # Load SAE
@@ -214,15 +227,28 @@ def train_with_auxiliary_loss(
     if sae_checkpoint:
         sae = load_sae(cfg, cycle=prev_cycle, checkpoint_path=sae_checkpoint)
     else:
-        # Auto-find checkpoint
-        outputs_dir = Path('outputs')
-        checkpoint_pattern = f"**/checkpoints/sae_cycle_{prev_cycle}_best.pt"
-        checkpoints = sorted(outputs_dir.glob(checkpoint_pattern), key=lambda p: p.stat().st_mtime, reverse=True)
-        if checkpoints:
-            sae = load_sae(cfg, cycle=prev_cycle, checkpoint_path=str(checkpoints[0]))
+        # First try current run's checkpoint directory (for multirun)
+        checkpoint_dir = Path(cfg.checkpoint_dir)
+        checkpoint_path = checkpoint_dir / f"sae_cycle_{prev_cycle}_best.pt"
+        
+        if checkpoint_path.exists():
+            logger.info(f"Found SAE in current run dir: {checkpoint_path}")
+            sae = load_sae(cfg, cycle=prev_cycle, checkpoint_path=str(checkpoint_path))
         else:
-            raise FileNotFoundError(f"No SAE checkpoint found for cycle {prev_cycle}")
-    
+            # Fallback: search in outputs/ (for single runs)
+            logger.info(f"SAE not in {checkpoint_dir}, searching outputs/...")
+            outputs_dir = Path('outputs')
+            checkpoint_pattern = f"**/checkpoints/sae_cycle_{prev_cycle}_best.pt"
+            checkpoints = sorted(outputs_dir.glob(checkpoint_pattern), 
+                               key=lambda p: p.stat().st_mtime, reverse=True)
+            if checkpoints:
+                logger.info(f"Found SAE: {checkpoints[0]}")
+                sae = load_sae(cfg, cycle=prev_cycle, checkpoint_path=str(checkpoints[0]))
+            else:
+                raise FileNotFoundError(
+                    f"No SAE checkpoint found for cycle {prev_cycle}. "
+                    f"Searched: {checkpoint_dir} and {outputs_dir}"
+                )
     sae.to(device)
     sae.eval()
     

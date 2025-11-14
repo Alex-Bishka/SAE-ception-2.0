@@ -229,6 +229,72 @@ def compare_models(
     return comparison
 
 
+def k_sparse_probe_accuracy(
+    sparse_codes: torch.Tensor,
+    labels: torch.Tensor,
+    k_values: list = [1, 5, 10, 25, 50],
+) -> Dict[str, float]:
+    """
+    Train linear probes using only the top-k active features per example.
+    
+    This measures how much task information is contained in the most active features,
+    which is directly relevant for SAE-ception's top-k sharpening strategy.
+    
+    Args:
+        sparse_codes: Shape [N, hidden_dim] - SAE sparse codes
+        labels: Shape [N] - class labels
+        k_values: List of k values to try
+        
+    Returns:
+        Dictionary with accuracy for each k value
+    """
+    # Convert to numpy
+    codes = sparse_codes.numpy() if isinstance(sparse_codes, torch.Tensor) else sparse_codes
+    y = labels.numpy() if isinstance(labels, torch.Tensor) else labels
+    
+    # Split train/test (80/20)
+    n_samples = len(codes)
+    n_train = int(0.8 * n_samples)
+    
+    X_train, X_test = codes[:n_train], codes[n_train:]
+    y_train, y_test = y[:n_train], y[n_train:]
+    
+    results = {}
+    
+    for k in k_values:
+        # For each example, keep only top-k active features
+        X_train_k = np.zeros_like(X_train)
+        X_test_k = np.zeros_like(X_test)
+        
+        # Train set
+        for i in range(len(X_train)):
+            if k >= X_train.shape[1]:
+                X_train_k[i] = X_train[i]
+            else:
+                top_k_indices = np.argpartition(X_train[i], -k)[-k:]
+                X_train_k[i, top_k_indices] = X_train[i, top_k_indices]
+        
+        # Test set
+        for i in range(len(X_test)):
+            if k >= X_test.shape[1]:
+                X_test_k[i] = X_test[i]
+            else:
+                top_k_indices = np.argpartition(X_test[i], -k)[-k:]
+                X_test_k[i, top_k_indices] = X_test[i, top_k_indices]
+        
+        # Train logistic regression
+        clf = LogisticRegression(max_iter=1000, random_state=42, solver='lbfgs')
+        clf.fit(X_train_k, y_train)
+        
+        # Evaluate
+        y_pred = clf.predict(X_test_k)
+        acc = accuracy_score(y_test, y_pred)
+        
+        results[f'k_sparse_probe_k{k}'] = float(acc)
+    
+    return results
+
+
 def evaluate_model_and_sae(
     model: nn.Module,
     sae: nn.Module,
@@ -283,27 +349,35 @@ def evaluate_model_and_sae(
     )
     results.update({f'probe_{k}': v for k, v in probe_metrics.items()})
     
-    # 3. SAE quality
+    # 3. K-sparse probing (NEW)
+    print("Evaluating k-sparse probe accuracy...")
+    k_sparse_metrics = k_sparse_probe_accuracy(
+        sparse_codes_val, val_labels,
+        k_values=[1, 5, 10, 25, 50],
+    )
+    results.update(k_sparse_metrics)
+    
+    # 4. SAE quality (includes dead features % and usage entropy)
     print("Evaluating SAE quality...")
     sae_metrics = evaluate_sae_quality(sae, val_activations, device)
     results.update({f'sae_{k}': v for k, v in sae_metrics.items()})
     
-    # 4. Monosemanticity of base activations
+    # 5. Monosemanticity of base activations
     print("Computing monosemanticity metrics (base model)...")
     mono_base = compute_monosemanticity_metrics(val_activations, val_labels)
     results.update({f'base_{k}': v for k, v in mono_base.items()})
     
-    # 5. Monosemanticity of SAE features
+    # 6. Monosemanticity of SAE features
     print("Computing monosemanticity metrics (SAE features)...")
     mono_sae = compute_monosemanticity_metrics(sparse_codes_val, val_labels)
     results.update({f'sae_features_{k}': v for k, v in mono_sae.items()})
     
-    # 6. Clustering metrics
+    # 7. Clustering metrics
     print("Computing clustering metrics...")
     clustering = compute_all_clustering_metrics(sparse_codes_val, val_labels)
     results.update({f'clustering_{k}': v for k, v in clustering.items()})
     
-    # 7. Sparsity metrics
+    # 8. Sparsity metrics
     print("Computing sparsity metrics...")
     sparsity = compute_sparsity_metrics(sparse_codes_val)
     results.update({f'sparsity_{k}': v for k, v in sparsity.items()})

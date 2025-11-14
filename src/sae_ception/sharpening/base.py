@@ -5,8 +5,20 @@ import torch
 class FeatureSharpener(ABC):
     """Abstract base class for feature sharpening strategies."""
     
-    def __init__(self, top_k: int = 25):
-        self.top_k = top_k
+    def __init__(self, top_k_pct: float = 0.5):
+        """
+        Args:
+            top_k_pct: Percentage of features to keep (0-100)
+                      e.g., 0.5 = keep top 0.5% of features
+                      1.0 = keep top 1% of features
+        """
+        self.top_k_pct = top_k_pct
+    
+    def _compute_k(self, hidden_dim: int) -> int:
+        """Convert percentage to absolute k value."""
+        k = int(hidden_dim * self.top_k_pct / 100.0)
+        # Ensure at least 1 feature is kept
+        return max(1, k)
     
     @abstractmethod
     def identify_salient_features(
