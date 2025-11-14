@@ -56,42 +56,8 @@ uv run python scripts/train_cycle.py -m \
     cycle.max_cycles=2 \
     model.epochs_per_cycle=2 \
     sae.epochs=3 \
-    sae.l1_penalty=3e-4, 5e-4, 7e-4, 1e-3 \
+    sae.l1_penalty=3e-4,5e-4,7e-4,1e-3 \
     sharpening.top_k_pct=0.25 \
     cycle.aux_loss_weight=0.01 \
     wandb.mode=online
 # ----------------------------
-
-# testing one cycle multirun
-# uv run python scripts/train_cycle.py -m \
-#     model=gpt2_small \
-#     model.hf_path=EleutherAI/pythia-70m \
-#     model.hidden_size=512 \
-#     dataset=sst2 \
-#     cycle.current=0 \
-#     cycle.max_cycles=0 \
-#     model.epochs_per_cycle=1 \
-#     sae.epochs=1 \
-#     sae.l1_penalty=5e-4,1e-3 \
-#     wandb.mode=disabled
-
-# testing one cycle 
-# uv run python scripts/train_cycle.py \
-#     cycle.current=0 \
-#     cycle.max_cycles=0 \
-#     model.epochs_per_cycle=1 \
-#     sae.epochs=1 \
-#     wandb.mode=disabled
-
-# small, but decent grid search of 9 runs
-# uv run python scripts/train_cycle.py -m \
-#     model=gpt2_small \
-#     dataset=sst2 \
-#     cycle.current=0 \
-#     cycle.max_cycles=2 \
-#     model.epochs_per_cycle=2 \
-#     sae.epochs=3 \
-#     sae.l1_penalty=5e-4,1e-3,2e-3 \
-#     sharpening.top_k_pct=0.1,0.25,0.5 \
-#     cycle.aux_loss_weight=0.01 \
-#     wandb.mode=online
