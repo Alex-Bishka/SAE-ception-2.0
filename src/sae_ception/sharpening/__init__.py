@@ -9,9 +9,9 @@ def get_sharpener(cfg) -> FeatureSharpener:
     sharpener_type = cfg.type
     
     if sharpener_type == "per_class":
-        return PerClassSharpener(top_k=cfg.get("top_k", 25))
+        return PerClassSharpener(top_k_pct=cfg.get("top_k_pct", 0.5))
     elif sharpener_type == "per_example":
-        return PerExampleSharpener(top_k=cfg.get("top_k", 25))
+        return PerExampleSharpener(top_k_pct=cfg.get("top_k_pct", 0.5))
     elif sharpener_type == "random":
         return RandomSharpener(seed=cfg.get("seed", 42))
     else:

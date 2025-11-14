@@ -2,7 +2,7 @@ import torch
 from pathlib import Path
 
 # Find your results file
-path = "/home1/abishka@hmc.edu/scratch/saeception/run_19340/multirun/2025-11-13/23-33-39/1/checkpoints/results_cycle_0.pt"
+path = "/home1/abishka@hmc.edu/scratch/saeception/run_19374/multirun/2025-11-14/12-51-30/1/checkpoints/results_cycle_1.pt"
 print(path)
 results_path = Path(path)
 results = torch.load(results_path)
