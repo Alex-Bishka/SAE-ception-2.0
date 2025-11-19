@@ -134,7 +134,7 @@ def get_or_create_starting_point(cfg, device):
     cache_dir = Path(cfg.cache_dir) / cache_key
 
     # Clear cache if requested
-    if cfg.clear_cache and cache_dir.exists():
+    if getattr(cfg, 'clear_cache', False) and cache_dir.exists():
         logger.info(f"Clearing cache: {cache_dir}")
         import shutil
         shutil.rmtree(cache_dir)
@@ -170,9 +170,17 @@ def get_or_create_starting_point(cfg, device):
     # Evaluate
     results = evaluate_cycle(cfg, model, sae, cycle=-1, device=device)
     
-    # Cache everything
-    torch.save(model.state_dict(), model_path)
-    torch.save(sae.state_dict(), sae_path)
+    # Cache everything in proper checkpoint format
+    torch.save({
+        'model_state_dict': model.state_dict(),
+        'val_accuracy': results.get('task_accuracy', 0.0),
+    }, model_path)
+    
+    torch.save({
+        'model_state_dict': sae.state_dict(),
+        'val_l0_norm': results.get('sparsity_l0_mean', 0.0),
+    }, sae_path)
+    
     torch.save(results, results_path)
     logger.info(f"✓ Cached {prefix} to {cache_dir}")
     
@@ -211,9 +219,16 @@ def run_single_cycle(cfg: DictConfig, cycle: int) -> tuple:
         temp_model_path = checkpoint_dir / "model_baseline_temp.pt"
         temp_sae_path = checkpoint_dir / "sae_baseline_temp.pt"
         
-        torch.save(base_model.state_dict(), temp_model_path)
-        torch.save(base_sae.state_dict(), temp_sae_path)
-        
+        torch.save({
+            'model_state_dict': base_model.state_dict(),
+            'val_accuracy': baseline_results.get('task_accuracy', 0.0),
+        }, temp_model_path)
+
+        torch.save({
+            'model_state_dict': base_sae.state_dict(),
+            'val_l0_norm': baseline_results.get('sparsity_l0_mean', 0.0),
+        }, temp_sae_path)
+
         # Train cycle 0 WITH aux loss using base_sae
         model = train_with_auxiliary_loss(
             cfg, 
@@ -257,10 +272,6 @@ def run_single_cycle(cfg: DictConfig, cycle: int) -> tuple:
     
     sae, _, _ = train_sae(cfg, model=model, cycle=cycle)
     
-    # Save SAE
-    checkpoint_dir = Path(cfg.checkpoint_dir)
-    torch.save(sae.state_dict(), checkpoint_dir / f"sae_cycle_{cycle}.pt")
-    
     # Step 3: Evaluate current cycle
     results = evaluate_cycle(cfg, model, sae, cycle, device)
     
@@ -288,10 +299,6 @@ def run_single_cycle(cfg: DictConfig, cycle: int) -> tuple:
         logger.info("=" * 60)
         
         next_model = train_with_auxiliary_loss(cfg, prev_cycle=cycle)
-        
-        # Save next model
-        torch.save(next_model.state_dict(), 
-                  checkpoint_dir / f"model_cycle_{cycle + 1}.pt")
     else:
         logger.info(f"Reached max_cycles ({cfg.cycle.max_cycles}). Stopping.")
     
