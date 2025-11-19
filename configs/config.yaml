@@ -21,6 +21,7 @@ checkpoint_dir: ${output_dir}/checkpoints
 data_cache_dir: ./data_cache
 start_from: baseline  # 'baseline' (pretrained) or 'finetuned'
 cache_dir: ./cache    # Persistent cache across runs
+clear_cache: false
 
 # SAE-ception cycle parameters
 cycle:
