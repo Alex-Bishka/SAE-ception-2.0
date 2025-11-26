@@ -252,7 +252,7 @@ def evaluate_sae_quality(
             batch = activations[i:i+batch_size].to(device)
             
             # Forward pass
-            reconstruction, sparse_code = sae(batch)
+            reconstruction, sparse_code, _ = sae(batch)
             
             # Reconstruction loss
             recon_loss = torch.nn.functional.mse_loss(reconstruction, batch)
