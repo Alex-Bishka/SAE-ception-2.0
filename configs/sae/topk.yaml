@@ -1,0 +1,22 @@
+# TopK SAE configuration
+# Uses top-k selection instead of L1 penalty for sparsity
+
+sae_type: topk
+
+# SAE architecture
+expansion_factor: 8  # hidden_dim = expansion_factor * input_dim
+k: 50               # Number of active features per input (controls sparsity)
+aux_k_coef: 0.03125 # Auxiliary loss coefficient (1/32, from Gao et al. 2024)
+
+# Training
+learning_rate: 1e-4
+batch_size: 64
+epochs: 5
+log_interval: 100
+
+# Optimization
+optimizer: adam
+weight_decay: 0.0
+
+# Included for compatibility with training code (not used for TopK)
+l1_penalty: 0.0

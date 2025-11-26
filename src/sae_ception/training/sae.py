@@ -9,7 +9,7 @@ from omegaconf import DictConfig
 from tqdm import tqdm
 import wandb
 
-from ..models.sae import SparseAutoencoder
+from ..models.sae import create_sae, SparseAutoencoder, TopKSparseAutoencoder
 from ..utils.data import create_dataloaders, extract_activations_from_model, create_activation_dataloader
 from ..utils.logger import get_logger
 from ..utils.checkpointing import save_checkpoint
@@ -19,11 +19,135 @@ from transformers import AutoTokenizer
 logger = get_logger(__name__)
 
 
+def load_sae(
+    cfg: DictConfig,
+    cycle: int,
+    checkpoint_path: str = None,
+) -> nn.Module:
+    """
+    Load a trained SAE from checkpoint.
+    
+    Args:
+        cfg: Configuration
+        cycle: Cycle number
+        checkpoint_path: Path to checkpoint (default: sae_cycle_X_best.pt)
+        
+    Returns:
+        Loaded SAE
+    """
+    if checkpoint_path is None:
+        checkpoint_path = Path(cfg.checkpoint_dir) / f"sae_cycle_{cycle}_best.pt"
+    
+    # Determine dimensions
+    if hasattr(cfg.model, 'hidden_size'):
+        activation_dim = cfg.model.hidden_size
+    else:
+        raise ValueError("Cannot determine activation dimension from config")
+    
+    hidden_dim = activation_dim * cfg.sae.expansion_factor
+    
+    # Determine SAE type
+    sae_type = getattr(cfg.sae, 'sae_type', 'l1')
+    
+    # Create SAE using factory function
+    sae = create_sae(
+        input_dim=activation_dim,
+        hidden_dim=hidden_dim,
+        sae_type=sae_type,
+        l1_penalty=cfg.sae.l1_penalty,
+        k=getattr(cfg.sae, 'k', 50),
+        aux_k_coef=getattr(cfg.sae, 'aux_k_coef', 1/32),
+        dead_steps_threshold=getattr(cfg.sae, 'dead_steps_threshold', 100),
+    )
+    
+    # Load weights
+    checkpoint = torch.load(checkpoint_path, map_location=cfg.device)
+    sae.load_state_dict(checkpoint['model_state_dict'])
+    
+    device = cfg.device if torch.cuda.is_available() else 'cpu'
+    sae.to(device)
+    sae.eval()
+    
+    logger.info(f"Loaded {sae_type.upper()} SAE from {checkpoint_path}")
+    if 'val_l0_norm' in checkpoint.get('metrics', {}):
+        logger.info(f"Checkpoint val L0 norm: {checkpoint['metrics']['val_l0_norm']:.2f}")
+    if 'val_dead_pct' in checkpoint.get('metrics', {}):
+        logger.info(f"Checkpoint val dead features: {checkpoint['metrics']['val_dead_pct']:.1f}%")
+    
+    return sae
+
+def compute_geometric_median(x: torch.Tensor, num_iters: int = 10) -> torch.Tensor:
+    """
+    Compute approximate geometric median using Weiszfeld's algorithm.
+    
+    This is used to initialize the pre_bias, which helps center the data
+    in a way that's robust to outliers.
+    """
+    # Start with the mean as initial estimate
+    median = x.mean(dim=0)
+    
+    for _ in range(num_iters):
+        # Compute distances from current estimate
+        dists = torch.norm(x - median, dim=1, keepdim=True)
+        # Avoid division by zero
+        dists = torch.clamp(dists, min=1e-8)
+        # Weighted average (inverse distance weighting)
+        weights = 1.0 / dists
+        median = (x * weights).sum(dim=0) / weights.sum()
+    
+    return median
+
+
+def init_sae_from_data_(
+    sae: nn.Module, 
+    activations: torch.Tensor,
+    device: str,
+) -> None:
+    """
+    Initialize SAE parameters from data statistics (OpenAI's approach).
+    
+    This helps prevent dead features by:
+    1. Setting pre_bias to geometric median (centers data robustly)
+    2. Scaling encoder so initial reconstructions have reasonable norm
+    """
+    logger.info("Initializing SAE from data statistics...")
+    
+    # Use subset for efficiency
+    sample = activations[:min(32768, len(activations))].to(device)
+    
+    # 1. Initialize pre_bias to geometric median
+    with torch.no_grad():
+        geometric_med = compute_geometric_median(sample.float())
+        sae.pre_bias.data = geometric_med.to(sae.pre_bias.dtype)
+    
+    logger.info(f"  Pre-bias initialized (norm: {sae.pre_bias.norm().item():.4f})")
+    
+    # 2. Scale encoder based on initial reconstruction norm
+    # This ensures activations start in a reasonable range
+    if hasattr(sae, 'encoder'):
+        with torch.no_grad():
+            # Test with random normalized inputs
+            x = torch.randn(256, sae.input_dim, device=device)
+            x = x / x.norm(dim=-1, keepdim=True)
+            x = x + sae.pre_bias.data
+            
+            # Get initial reconstruction
+            recons, _, _ = sae(x)
+            recons_centered = recons - sae.pre_bias.data
+            recons_norm = recons_centered.norm(dim=-1).mean()
+            
+            # Scale encoder to normalize reconstruction magnitude
+            if recons_norm > 1e-6:
+                sae.encoder.weight.data /= recons_norm.item()
+                logger.info(f"  Encoder scaled by 1/{recons_norm.item():.4f}")
+
+
 def train_sae_epoch(
     sae: nn.Module,
     dataloader: DataLoader,
     optimizer: torch.optim.Optimizer,
     device: str,
+    clip_grad: float = None,
 ) -> dict:
     """Train SAE for one epoch."""
     sae.train()
@@ -32,6 +156,7 @@ def train_sae_epoch(
     total_recon_loss = 0.0
     total_sparsity_loss = 0.0
     total_l0 = 0.0
+    total_dead_pct = 0.0
     num_batches = 0
     
     progress_bar = tqdm(dataloader, desc="Training SAE")
@@ -40,36 +165,67 @@ def train_sae_epoch(
         activations = batch['activations'].to(device)
         
         # Forward pass
-        reconstruction, sparse_code = sae(activations)
+        reconstruction, sparse_code, info = sae(activations)
         
         # Compute loss
-        loss_dict = sae.loss(activations, reconstruction, sparse_code)
+        loss_dict = sae.loss(activations, reconstruction, sparse_code, info=info)
         loss = loss_dict['total_loss']
         
         # Backward pass
         optimizer.zero_grad()
         loss.backward()
+        
+        # Optional gradient clipping (OpenAI uses this)
+        if clip_grad is not None:
+            torch.nn.utils.clip_grad_norm_(sae.parameters(), clip_grad)
+        
         optimizer.step()
+        
+        # Normalize decoder after each step (important for TopK!)
+        if hasattr(sae, 'normalize_decoder_'):
+            sae.normalize_decoder_()
         
         # Track metrics
         total_loss += loss_dict['total_loss'].item()
         total_recon_loss += loss_dict['reconstruction_loss'].item()
-        total_sparsity_loss += loss_dict['sparsity_loss'].item()
+        sparsity = loss_dict.get('sparsity_loss', loss_dict.get('aux_loss', 0.0))
+        if isinstance(sparsity, torch.Tensor):
+            sparsity = sparsity.item()
+        total_sparsity_loss += sparsity
         total_l0 += loss_dict['l0_norm'].item()
+        
+        # Track dead features for TopK
+        if 'dead_pct' in loss_dict:
+            dead_pct = loss_dict['dead_pct']
+            if isinstance(dead_pct, torch.Tensor):
+                dead_pct = dead_pct.item()
+            total_dead_pct += dead_pct
+        
         num_batches += 1
         
         # Update progress bar
-        progress_bar.set_postfix({
+        postfix = {
             'loss': loss.item(),
             'l0': loss_dict['l0_norm'].item(),
-        })
+        }
+        if 'dead_pct' in loss_dict:
+            dead_val = loss_dict['dead_pct']
+            if isinstance(dead_val, torch.Tensor):
+                dead_val = dead_val.item()
+            postfix['dead%'] = f"{dead_val:.1f}"
+        progress_bar.set_postfix(postfix)
     
-    return {
+    metrics = {
         'loss': total_loss / num_batches,
         'reconstruction_loss': total_recon_loss / num_batches,
         'sparsity_loss': total_sparsity_loss / num_batches,
         'l0_norm': total_l0 / num_batches,
     }
+    
+    if total_dead_pct > 0:
+        metrics['dead_pct'] = total_dead_pct / num_batches
+    
+    return metrics
 
 
 def evaluate_sae(
@@ -84,6 +240,7 @@ def evaluate_sae(
     total_recon_loss = 0.0
     total_sparsity_loss = 0.0
     total_l0 = 0.0
+    total_dead_pct = 0.0
     num_batches = 0
     
     with torch.no_grad():
@@ -91,24 +248,41 @@ def evaluate_sae(
             activations = batch['activations'].to(device)
             
             # Forward pass
-            reconstruction, sparse_code = sae(activations)
+            reconstruction, sparse_code, info = sae(activations)
             
             # Compute loss
-            loss_dict = sae.loss(activations, reconstruction, sparse_code)
+            loss_dict = sae.loss(activations, reconstruction, sparse_code, info=info)
             
             # Track metrics
             total_loss += loss_dict['total_loss'].item()
             total_recon_loss += loss_dict['reconstruction_loss'].item()
-            total_sparsity_loss += loss_dict['sparsity_loss'].item()
+            
+            sparsity = loss_dict.get('sparsity_loss', loss_dict.get('aux_loss', 0.0))
+            if isinstance(sparsity, torch.Tensor):
+                sparsity = sparsity.item()
+            total_sparsity_loss += sparsity
+            
             total_l0 += loss_dict['l0_norm'].item()
+            
+            if 'dead_pct' in loss_dict:
+                dead_pct = loss_dict['dead_pct']
+                if isinstance(dead_pct, torch.Tensor):
+                    dead_pct = dead_pct.item()
+                total_dead_pct += dead_pct
+            
             num_batches += 1
     
-    return {
+    metrics = {
         'loss': total_loss / num_batches,
         'reconstruction_loss': total_recon_loss / num_batches,
         'sparsity_loss': total_sparsity_loss / num_batches,
         'l0_norm': total_l0 / num_batches,
     }
+    
+    if total_dead_pct > 0:
+        metrics['dead_pct'] = total_dead_pct / num_batches
+    
+    return metrics
 
 
 def train_sae(
@@ -116,21 +290,16 @@ def train_sae(
     model: nn.Module = None,
     cycle: int = 0,
     baseline_checkpoint: str = None,
-) -> tuple[SparseAutoencoder, DataLoader, DataLoader]:
+) -> tuple[nn.Module, DataLoader, DataLoader]:
     """
     Train Sparse Autoencoder on model activations.
-    
-    Args:
-        cfg: Hydra configuration
-        model: Pre-trained model (if None, loads from checkpoint)
-        cycle: Current SAE-ception cycle
-        baseline_checkpoint: Path to baseline model checkpoint (optional)
-        
-    Returns:
-        Tuple of (trained_sae, train_activation_loader, val_activation_loader)
     """
+    # Determine SAE type
+    sae_type = getattr(cfg.sae, 'sae_type', 'l1')
+    
     logger.info("=" * 60)
     logger.info(f"Training SAE (Cycle {cycle})")
+    logger.info(f"SAE Type: {sae_type.upper()}")
     logger.info("=" * 60)
     
     device = cfg.device if torch.cuda.is_available() else 'cpu'
@@ -143,21 +312,17 @@ def train_sae(
             logger.info(f"Using checkpoint: {baseline_checkpoint}")
             model = load_baseline_model(cfg, checkpoint_path=baseline_checkpoint)
         else:
-            # Try to find checkpoint in current or parent directories
             checkpoint_path = None
             
-            # First, try the configured checkpoint_dir
             if hasattr(cfg, 'checkpoint_dir'):
                 potential_path = Path(cfg.checkpoint_dir) / f"model_cycle_{cycle}_best.pt"
                 if potential_path.exists():
                     checkpoint_path = potential_path
             
-            # If not found, look in parent outputs directory
             if checkpoint_path is None:
                 outputs_dir = Path.cwd().parent.parent if 'outputs' in str(Path.cwd()) else Path('outputs')
                 logger.info(f"Searching for baseline checkpoint in: {outputs_dir}")
                 
-                # Find most recent baseline checkpoint
                 checkpoint_pattern = f"**/checkpoints/model_cycle_{cycle}_best.pt"
                 checkpoints = sorted(outputs_dir.glob(checkpoint_pattern), key=lambda p: p.stat().st_mtime, reverse=True)
                 
@@ -195,7 +360,7 @@ def train_sae(
         dataloader=train_loader,
         layer_name=str(cfg.model.target_layer),
         device=device,
-        token_position='last',  # Use last token for classification
+        token_position='last',
     )
     
     logger.info("Extracting validation activations...")
@@ -212,16 +377,35 @@ def train_sae(
     logger.info(f"Train activations: {train_acts.shape}")
     logger.info(f"Val activations: {val_acts.shape}")
     
-    # Create SAE
+    # Create SAE using factory function
     hidden_dim = activation_dim * cfg.sae.expansion_factor
-    logger.info(f"Creating SAE: {activation_dim} -> {hidden_dim} -> {activation_dim}")
     
-    sae = SparseAutoencoder(
+    if sae_type == "topk":
+        k = getattr(cfg.sae, 'k', 50)
+        aux_k_coef = getattr(cfg.sae, 'aux_k_coef', 1/32)
+        dead_steps_threshold = getattr(cfg.sae, 'dead_steps_threshold', 100)
+        logger.info(f"Creating TopK SAE: {activation_dim} -> {hidden_dim} -> {activation_dim}")
+        logger.info(f"  k={k} (target L0 sparsity)")
+        logger.info(f"  aux_k_coef={aux_k_coef}")
+        logger.info(f"  dead_steps_threshold={dead_steps_threshold}")
+    else:
+        logger.info(f"Creating L1 SAE: {activation_dim} -> {hidden_dim} -> {activation_dim}")
+        logger.info(f"  L1 penalty: {cfg.sae.l1_penalty}")
+    
+    sae = create_sae(
         input_dim=activation_dim,
         hidden_dim=hidden_dim,
+        sae_type=sae_type,
         l1_penalty=cfg.sae.l1_penalty,
+        k=getattr(cfg.sae, 'k', 50),
+        aux_k_coef=getattr(cfg.sae, 'aux_k_coef', 1/32),
+        dead_steps_threshold=getattr(cfg.sae, 'dead_steps_threshold', 100),
     )
     sae.to(device)
+    
+    # Initialize from data (important for TopK!)
+    if sae_type == "topk":
+        init_sae_from_data_(sae, train_acts, device)
     
     # Count parameters
     total_params = sum(p.numel() for p in sae.parameters())
@@ -245,16 +429,20 @@ def train_sae(
         sae.parameters(),
         lr=cfg.sae.learning_rate,
         weight_decay=cfg.sae.weight_decay,
+        eps=getattr(cfg.sae, 'adam_eps', 1e-8),  # OpenAI uses 6.25e-10
     )
+    
+    # Get gradient clipping value
+    clip_grad = getattr(cfg.sae, 'clip_grad', None)
     
     # Initialize wandb
     if cfg.wandb.mode != 'disabled':
         wandb.init(
             project=cfg.wandb.project,
             entity=cfg.wandb.entity,
-            name=f"sae_cycle_{cycle}_{cfg.dataset.name}",
+            name=f"sae_{sae_type}_cycle_{cycle}_{cfg.dataset.name}",
             config=dict(cfg),
-            tags=['sae', f'cycle_{cycle}'],
+            tags=['sae', sae_type, f'cycle_{cycle}'],
         )
     
     # Training loop
@@ -270,11 +458,16 @@ def train_sae(
             dataloader=train_act_loader,
             optimizer=optimizer,
             device=device,
+            clip_grad=clip_grad,
         )
         
         logger.info(f"Train Loss: {train_metrics['loss']:.4f}")
         logger.info(f"Train Reconstruction Loss: {train_metrics['reconstruction_loss']:.4f}")
-        logger.info(f"Train Sparsity Loss: {train_metrics['sparsity_loss']:.4f}")
+        if sae_type == "l1":
+            logger.info(f"Train Sparsity Loss: {train_metrics['sparsity_loss']:.4f}")
+        elif sae_type == "topk" and 'dead_pct' in train_metrics:
+            logger.info(f"Train Aux Loss: {train_metrics['sparsity_loss']:.4f}")
+            logger.info(f"Train Dead Features: {train_metrics['dead_pct']:.1f}%")
         logger.info(f"Train L0 Norm: {train_metrics['l0_norm']:.2f}")
         
         # Evaluate
@@ -284,10 +477,12 @@ def train_sae(
         logger.info(f"Val Loss: {val_metrics['loss']:.4f}")
         logger.info(f"Val Reconstruction Loss: {val_metrics['reconstruction_loss']:.4f}")
         logger.info(f"Val L0 Norm: {val_metrics['l0_norm']:.2f}")
+        if 'dead_pct' in val_metrics:
+            logger.info(f"Val Dead Features: {val_metrics['dead_pct']:.1f}%")
         
         # Log to wandb
         if cfg.wandb.mode != 'disabled':
-            wandb.log({
+            log_dict = {
                 'epoch': epoch,
                 'train/loss': train_metrics['loss'],
                 'train/reconstruction_loss': train_metrics['reconstruction_loss'],
@@ -296,27 +491,39 @@ def train_sae(
                 'val/loss': val_metrics['loss'],
                 'val/reconstruction_loss': val_metrics['reconstruction_loss'],
                 'val/l0_norm': val_metrics['l0_norm'],
-            })
+            }
+            
+            # Add dead feature tracking for TopK
+            if 'dead_pct' in train_metrics:
+                log_dict['train/dead_pct'] = train_metrics['dead_pct']
+            if 'dead_pct' in val_metrics:
+                log_dict['val/dead_pct'] = val_metrics['dead_pct']
+            
+            wandb.log(log_dict)
         
         # Save best model
         if val_metrics['loss'] < best_val_loss:
             best_val_loss = val_metrics['loss']
             logger.info(f"New best validation loss: {best_val_loss:.4f}")
             
-            # Save checkpoint
             checkpoint_dir = Path(cfg.checkpoint_dir)
             checkpoint_dir.mkdir(parents=True, exist_ok=True)
             
             checkpoint_path = checkpoint_dir / f"sae_cycle_{cycle}_best.pt"
+            
+            metrics_to_save = {
+                'val_loss': val_metrics['loss'],
+                'val_l0_norm': val_metrics['l0_norm'],
+            }
+            if 'dead_pct' in val_metrics:
+                metrics_to_save['val_dead_pct'] = val_metrics['dead_pct']
+            
             save_checkpoint(
                 path=checkpoint_path,
                 model=sae,
                 optimizer=optimizer,
                 epoch=epoch,
-                metrics={
-                    'val_loss': val_metrics['loss'],
-                    'val_l0_norm': val_metrics['l0_norm'],
-                },
+                metrics=metrics_to_save,
             )
     
     # Load best model
@@ -333,65 +540,20 @@ def train_sae(
     logger.info(f"Final Val Loss: {final_metrics['loss']:.4f}")
     logger.info(f"Final Val Reconstruction Loss: {final_metrics['reconstruction_loss']:.4f}")
     logger.info(f"Final Val L0 Norm: {final_metrics['l0_norm']:.2f}")
+    if 'dead_pct' in final_metrics:
+        logger.info(f"Final Val Dead Features: {final_metrics['dead_pct']:.1f}%")
     
     if cfg.wandb.mode != 'disabled':
-        wandb.log({
+        final_log = {
             'final/val_loss': final_metrics['loss'],
             'final/val_reconstruction_loss': final_metrics['reconstruction_loss'],
             'final/val_l0_norm': final_metrics['l0_norm'],
-        })
+        }
+        if 'dead_pct' in final_metrics:
+            final_log['final/val_dead_pct'] = final_metrics['dead_pct']
+        wandb.log(final_log)
         wandb.finish()
     
     logger.info("SAE training complete!")
     
     return sae, train_act_loader, val_act_loader
-
-
-def load_sae(
-    cfg: DictConfig,
-    cycle: int,
-    checkpoint_path: str = None,
-) -> SparseAutoencoder:
-    """
-    Load a trained SAE from checkpoint.
-    
-    Args:
-        cfg: Configuration
-        cycle: Cycle number
-        checkpoint_path: Path to checkpoint (default: sae_cycle_X_best.pt)
-        
-    Returns:
-        Loaded SAE
-    """
-    if checkpoint_path is None:
-        checkpoint_path = Path(cfg.checkpoint_dir) / f"sae_cycle_{cycle}_best.pt"
-    
-    # Determine dimensions
-    # We need to know the activation dimension - get from model config
-    if hasattr(cfg.model, 'hidden_size'):
-        activation_dim = cfg.model.hidden_size
-    else:
-        raise ValueError("Cannot determine activation dimension from config")
-    
-    hidden_dim = activation_dim * cfg.sae.expansion_factor
-    
-    # Create SAE
-    sae = SparseAutoencoder(
-        input_dim=activation_dim,
-        hidden_dim=hidden_dim,
-        l1_penalty=cfg.sae.l1_penalty,
-    )
-    
-    # Load weights
-    checkpoint = torch.load(checkpoint_path, map_location=cfg.device)
-    sae.load_state_dict(checkpoint['model_state_dict'])
-    
-    device = cfg.device if torch.cuda.is_available() else 'cpu'
-    sae.to(device)
-    sae.eval()
-    
-    logger.info(f"Loaded SAE from {checkpoint_path}")
-    if 'val_l0_norm' in checkpoint:
-        logger.info(f"Checkpoint val L0 norm: {checkpoint['val_l0_norm']:.2f}")
-    
-    return sae

@@ -1,6 +1,12 @@
+# Default SAE configuration (L1-penalized)
+# For TopK SAE, use: sae=topk
+
+sae_type: l1  # Options: 'l1', 'topk', 'topk_ste'
+
 # SAE architecture
 expansion_factor: 8  # hidden_dim = expansion_factor * input_dim
-l1_penalty: 2e-4
+l1_penalty: 2e-4     # L1 sparsity penalty (only used for sae_type=l1)
+k: 50                # TopK sparsity (only used for sae_type=topk/topk_ste)
 
 # Training
 learning_rate: 1e-4

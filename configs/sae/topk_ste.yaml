@@ -1,0 +1,21 @@
+# TopK SAE with Straight-Through Estimator
+# Uses top-k selection with better gradient flow for all features
+
+sae_type: topk_ste
+
+# SAE architecture
+expansion_factor: 8  # hidden_dim = expansion_factor * input_dim
+k: 50               # Number of active features per input (controls sparsity)
+
+# Training
+learning_rate: 1e-4
+batch_size: 64
+epochs: 5
+log_interval: 100
+
+# Optimization
+optimizer: adam
+weight_decay: 0.0
+
+# Note: STE variant allows gradients to flow to non-selected features
+# which can improve training dynamics and feature utilization
