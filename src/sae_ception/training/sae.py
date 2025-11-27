@@ -126,8 +126,9 @@ def init_sae_from_data_(
     # This ensures activations start in a reasonable range
     if hasattr(sae, 'encoder'):
         with torch.no_grad():
-            # Test with random normalized inputs
-            x = torch.randn(256, sae.input_dim, device=device)
+            # adaptation from OpenAI's implementation that uses random activations
+            batch_size = min(512, len(sample))
+            x = sample[:batch_size]
             x = x / x.norm(dim=-1, keepdim=True)
             x = x + sae.pre_bias.data
             
