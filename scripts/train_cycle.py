@@ -143,7 +143,11 @@ def get_or_create_cycle_0(cfg, device):
         Tuple of (model, sae, results)
     """
     # Cache location based on model + dataset + SAE config
-    cache_key = f"{cfg.model.name}_{cfg.dataset.name}_l1-{cfg.sae.l1_penalty}_exp-{cfg.sae.expansion_factor}"
+    sae_type = getattr(cfg.sae, 'sae_type', 'l1')
+    if sae_type == 'topk':
+        cache_key = f"{cfg.model.name}_{cfg.dataset.name}_topk-k{cfg.sae.k}_exp-{cfg.sae.expansion_factor}"
+    else:
+        cache_key = f"{cfg.model.name}_{cfg.dataset.name}_l1-{cfg.sae.l1_penalty}_exp-{cfg.sae.expansion_factor}"
     cache_dir = Path(cfg.cache_dir) / cache_key
 
     # Clear cache if requested
