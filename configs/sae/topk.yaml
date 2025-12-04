@@ -8,6 +8,11 @@ expansion_factor: 8  # hidden_dim = expansion_factor * input_dim
 k: 50               # Number of active features per input (controls sparsity)
 aux_k_coef: 0.03125 # Auxiliary loss coefficient (1/32, from Gao et al. 2024)
 
+# NEW: Token-level training (SAEBench compatible)
+# If true, trains on ALL tokens in each sequence
+# If false, trains only on final token (legacy behavior)
+token_level: true
+
 # Training
 learning_rate: 1e-4
 batch_size: 64
@@ -17,6 +22,9 @@ log_interval: 100
 # Optimization
 optimizer: adam
 weight_decay: 0.0
+
+# Dead feature tracking
+dead_steps_threshold: 100
 
 # Included for compatibility with training code (not used for TopK)
 l1_penalty: 0.0

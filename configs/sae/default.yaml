@@ -1,4 +1,4 @@
-# Default SAE configuration (L1-penalized)
+# Default SAE configuration
 # For TopK SAE, use: sae=topk
 
 sae_type: l1  # Options: 'l1', 'topk', 'topk_ste'
@@ -7,6 +7,11 @@ sae_type: l1  # Options: 'l1', 'topk', 'topk_ste'
 expansion_factor: 8  # hidden_dim = expansion_factor * input_dim
 l1_penalty: 2e-4     # L1 sparsity penalty (only used for sae_type=l1)
 k: 50                # TopK sparsity (only used for sae_type=topk/topk_ste)
+
+# NEW: Token-level training (SAEBench compatible)
+# If true, trains on ALL tokens in each sequence
+# If false, trains only on final token (legacy behavior)
+token_level: true
 
 # Training
 learning_rate: 1e-4

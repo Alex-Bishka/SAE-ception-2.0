@@ -28,3 +28,7 @@ cycle:
   current: 0
   max_cycles: 3
   aux_loss_weight: 0.01  # λ parameter
+
+# SAEBench evaluation parameters (optional)
+cycle_to_eval: null  # If null, uses cycle.current
+n_candidates: null
