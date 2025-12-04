@@ -10,7 +10,13 @@ from tqdm import tqdm
 import wandb
 
 from ..models.sae import create_sae, SparseAutoencoder, TopKSparseAutoencoder
-from ..utils.data import create_dataloaders, extract_activations_from_model, create_activation_dataloader
+from ..utils.data import (
+    create_dataloaders, 
+    extract_activations_from_model,
+    extract_activations_all_tokens,
+    extract_activations_final_token,
+    create_activation_dataloader,
+)
 from ..utils.logger import get_logger
 from ..utils.checkpointing import save_checkpoint
 from ..training.baseline import load_baseline_model
@@ -353,7 +359,69 @@ def train_sae(
     train_loader = dataloaders['train']
     val_loader = dataloaders['val']
     
-    # Extract activations from target layer
+    # Extract activations based on training mode
+    logger.info(f"Extracting activations from layer: {cfg.model.target_layer}")
+    
+    # Check token_level setting (NEW - default to True for SAEBench compatibility)
+    token_level = getattr(cfg.sae, 'token_level', True)
+    
+    if token_level:
+        # NEW: Token-level extraction for SAEBench compatibility
+        logger.info("Extracting ALL token activations (SAEBench compatible)...")
+        
+        train_acts, train_token_ids, train_labels = extract_activations_all_tokens(
+            model=model,
+            dataloader=train_loader,
+            layer_name=str(cfg.model.target_layer),
+            device=device,
+        )
+        
+        val_acts, val_token_ids, val_labels = extract_activations_all_tokens(
+            model=model,
+            dataloader=val_loader,
+            layer_name=str(cfg.model.target_layer),
+            device=device,
+        )
+        
+        logger.info(f"Train tokens: {train_acts.shape[0]:,} (from {len(train_loader.dataset)} sequences)")
+        logger.info(f"Val tokens: {val_acts.shape[0]:,} (from {len(val_loader.dataset)} sequences)")
+        
+        # Store token_ids for SAEBench evaluation later
+        checkpoint_dir = Path(cfg.checkpoint_dir)
+        checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        
+        torch.save({
+            'train_token_ids': train_token_ids,
+            'val_token_ids': val_token_ids,
+            'train_labels': train_labels,
+            'val_labels': val_labels,
+        }, checkpoint_dir / f"token_metadata_cycle_{cycle}.pt")
+        logger.info(f"Saved token metadata for SAEBench evaluation")
+        
+    else:
+        # Legacy: Sequence-level extraction (final token only)
+        logger.info("Extracting FINAL token activations only...")
+        
+        train_acts, train_labels = extract_activations_final_token(
+            model=model,
+            dataloader=train_loader,
+            layer_name=str(cfg.model.target_layer),
+            device=device,
+        )
+        
+        val_acts, val_labels = extract_activations_final_token(
+            model=model,
+            dataloader=val_loader,
+            layer_name=str(cfg.model.target_layer),
+            device=device,
+        )
+        
+        train_token_ids = None
+        val_token_ids = None
+        
+        logger.info(f"Train activations: {train_acts.shape}")
+        logger.info(f"Val activations: {val_acts.shape}")
+
     logger.info(f"Extracting activations from layer: {cfg.model.target_layer}")
     logger.info("Extracting training activations...")
     train_acts, train_labels = extract_activations_from_model(
@@ -375,8 +443,6 @@ def train_sae(
     
     activation_dim = train_acts.shape[1]
     logger.info(f"Activation dimension: {activation_dim}")
-    logger.info(f"Train activations: {train_acts.shape}")
-    logger.info(f"Val activations: {val_acts.shape}")
     
     # Create SAE using factory function
     hidden_dim = activation_dim * cfg.sae.expansion_factor
@@ -415,12 +481,14 @@ def train_sae(
     # Create activation dataloaders
     train_act_loader = create_activation_dataloader(
         train_acts, train_labels,
+        token_ids=train_token_ids,  # NEW
         batch_size=cfg.sae.batch_size,
         shuffle=True,
     )
     
     val_act_loader = create_activation_dataloader(
         val_acts, val_labels,
+        token_ids=val_token_ids,  # NEW
         batch_size=cfg.sae.batch_size,
         shuffle=False,
     )

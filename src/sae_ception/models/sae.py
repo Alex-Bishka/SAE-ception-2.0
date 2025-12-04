@@ -93,7 +93,7 @@ class TopKSparseAutoencoder(nn.Module):
         k: int = 50,
         auxk: int | None = None,
         aux_k_coef: float = 1/32,
-        dead_steps_threshold: int = 100,
+        dead_steps_threshold: int = 75,
     ):
         super().__init__()
         self.input_dim = input_dim
@@ -332,7 +332,7 @@ def create_sae(
             k=kwargs.get('k', 50),
             auxk=kwargs.get('auxk', None),
             aux_k_coef=kwargs.get('aux_k_coef', 1/32),
-            dead_steps_threshold=kwargs.get('dead_steps_threshold', 100),
+            dead_steps_threshold=kwargs.get('dead_steps_threshold', 75),
         )
     
     elif sae_type == 'topk_ste':

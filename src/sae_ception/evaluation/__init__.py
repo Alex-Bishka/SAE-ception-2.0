@@ -24,6 +24,12 @@ from .performance import (
     evaluate_perplexity,
     compare_models,
     evaluate_model_and_sae,
+    k_sparse_probe_accuracy,
+)
+
+from .saebench import (
+    compute_first_letter_absorption,
+    evaluate_sae_saebench,
 )
 
 
@@ -48,4 +54,8 @@ __all__ = [
     'evaluate_perplexity',
     'compare_models',
     'evaluate_model_and_sae',
+    'k_sparse_probe_accuracy',
+    # SAEBench
+    'compute_first_letter_absorption',
+    'evaluate_sae_saebench',
 ]
