@@ -421,25 +421,6 @@ def train_sae(
         
         logger.info(f"Train activations: {train_acts.shape}")
         logger.info(f"Val activations: {val_acts.shape}")
-
-    logger.info(f"Extracting activations from layer: {cfg.model.target_layer}")
-    logger.info("Extracting training activations...")
-    train_acts, train_labels = extract_activations_from_model(
-        model=model,
-        dataloader=train_loader,
-        layer_name=str(cfg.model.target_layer),
-        device=device,
-        token_position='last',
-    )
-    
-    logger.info("Extracting validation activations...")
-    val_acts, val_labels = extract_activations_from_model(
-        model=model,
-        dataloader=val_loader,
-        layer_name=str(cfg.model.target_layer),
-        device=device,
-        token_position='last',
-    )
     
     activation_dim = train_acts.shape[1]
     logger.info(f"Activation dimension: {activation_dim}")
