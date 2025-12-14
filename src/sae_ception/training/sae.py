@@ -24,6 +24,8 @@ from transformers import AutoTokenizer
 
 logger = get_logger(__name__)
 
+DEAD_STEPS_THRESHOLD = 50
+
 
 def load_sae(
     cfg: DictConfig,
@@ -63,7 +65,7 @@ def load_sae(
         l1_penalty=cfg.sae.l1_penalty,
         k=getattr(cfg.sae, 'k', 50),
         aux_k_coef=getattr(cfg.sae, 'aux_k_coef', 1/32),
-        dead_steps_threshold=getattr(cfg.sae, 'dead_steps_threshold', 100),
+        dead_steps_threshold=getattr(cfg.sae, 'dead_steps_threshold', DEAD_STEPS_THRESHOLD),
     )
     
     # Load weights
@@ -155,6 +157,8 @@ def train_sae_epoch(
     optimizer: torch.optim.Optimizer,
     device: str,
     clip_grad: float = None,
+    resample_interval: int = 0,
+    all_activations: torch.Tensor = None,
 ) -> dict:
     """Train SAE for one epoch."""
     sae.train()
@@ -431,7 +435,7 @@ def train_sae(
     if sae_type == "topk":
         k = getattr(cfg.sae, 'k', 50)
         aux_k_coef = getattr(cfg.sae, 'aux_k_coef', 1/32)
-        dead_steps_threshold = getattr(cfg.sae, 'dead_steps_threshold', 100)
+        dead_steps_threshold = getattr(cfg.sae, 'dead_steps_threshold', DEAD_STEPS_THRESHOLD)
         logger.info(f"Creating TopK SAE: {activation_dim} -> {hidden_dim} -> {activation_dim}")
         logger.info(f"  k={k} (target L0 sparsity)")
         logger.info(f"  aux_k_coef={aux_k_coef}")
@@ -447,7 +451,7 @@ def train_sae(
         l1_penalty=cfg.sae.l1_penalty,
         k=getattr(cfg.sae, 'k', 50),
         aux_k_coef=getattr(cfg.sae, 'aux_k_coef', 1/32),
-        dead_steps_threshold=getattr(cfg.sae, 'dead_steps_threshold', 100),
+        dead_steps_threshold=getattr(cfg.sae, 'dead_steps_threshold', DEAD_STEPS_THRESHOLD),
     )
     sae.to(device)
     
@@ -498,6 +502,8 @@ def train_sae(
     # Training loop
     logger.info(f"Training SAE for {cfg.sae.epochs} epochs...")
     best_val_loss = float('inf')
+
+    resample_interval = getattr(cfg.sae, 'resample_interval', 500)
     
     for epoch in range(cfg.sae.epochs):
         logger.info(f"Epoch {epoch + 1}/{cfg.sae.epochs}")
@@ -509,6 +515,8 @@ def train_sae(
             optimizer=optimizer,
             device=device,
             clip_grad=clip_grad,
+            resample_interval=resample_interval,
+            all_activations=train_acts,
         )
         
         logger.info(f"Train Loss: {train_metrics['loss']:.4f}")
