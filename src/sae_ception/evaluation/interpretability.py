@@ -18,7 +18,7 @@ def class_selectivity_index(
     Higher values (closer to 1) indicate more monosemantic features.
     
     Formula for feature i:
-        CSI_i = (μ_max - μ_other) / (μ_max + μ_other)
+        CSI_i = (μ_max - μ_other) / (|μ_max| + |μ_other|)
     
     where:
         μ_max = mean activation for the maximally activating class
@@ -66,9 +66,10 @@ def class_selectivity_index(
         else:
             mu_other = 0.0
         
-        # Compute CSI (handle division by zero)
-        if mu_max + mu_other > 1e-8:
-            csi = (mu_max - mu_other) / (mu_max + mu_other)
+        # Compute CSI with absolute values in denominator to handle negative activations
+        denom = abs(mu_max) + abs(mu_other)
+        if denom > 1e-8:
+            csi = (mu_max - mu_other) / denom
         else:
             csi = 0.0
         
