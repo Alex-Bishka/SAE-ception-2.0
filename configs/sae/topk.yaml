@@ -28,3 +28,6 @@ dead_steps_threshold: 100
 
 # Included for compatibility with training code (not used for TopK)
 l1_penalty: 0.0
+
+# Neuron resampling
+resample_interval: 500
