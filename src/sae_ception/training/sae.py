@@ -24,7 +24,7 @@ from transformers import AutoTokenizer
 
 logger = get_logger(__name__)
 
-DEAD_STEPS_THRESHOLD = 50
+DEAD_STEPS_THRESHOLD = 100
 
 
 def load_sae(
@@ -159,8 +159,24 @@ def train_sae_epoch(
     clip_grad: float = None,
     resample_interval: int = 0,
     all_activations: torch.Tensor = None,
-) -> dict:
-    """Train SAE for one epoch."""
+    global_step: int = 0,
+) -> tuple[dict, int]:
+    """
+    Train SAE for one epoch.
+    
+    Args:
+        sae: SAE model
+        dataloader: DataLoader for activations
+        optimizer: Optimizer
+        device: Device to train on
+        clip_grad: Optional gradient clipping value
+        resample_interval: Steps between resampling (0 = disabled)
+        all_activations: Full activation dataset for resampling
+        global_step: Current global step count (for resampling timing)
+        
+    Returns:
+        Tuple of (metrics dict, updated global_step)
+    """
     sae.train()
     
     total_loss = 0.0
@@ -168,6 +184,7 @@ def train_sae_epoch(
     total_sparsity_loss = 0.0
     total_l0 = 0.0
     total_dead_pct = 0.0
+    total_resampled = 0
     num_batches = 0
     
     progress_bar = tqdm(dataloader, desc="Training SAE")
@@ -195,6 +212,36 @@ def train_sae_epoch(
         # Normalize decoder after each step (important for TopK!)
         if hasattr(sae, 'normalize_decoder_'):
             sae.normalize_decoder_()
+        
+        # Debug: check every 500 steps
+        if global_step % 500 == 0:
+            dead_count = (sae.stats_last_nonzero > sae.dead_steps_threshold).sum().item()
+            max_steps = sae.stats_last_nonzero.max().item()
+            logger.info(f"  [DEBUG] Step {global_step}: max_steps_nonzero={max_steps}, dead_count={dead_count}, threshold={sae.dead_steps_threshold}")
+
+        global_step += 1
+        
+        # ============================================================
+        # NEURON RESAMPLING (NEW!)
+        # ============================================================
+        if (resample_interval > 0 and 
+            global_step % resample_interval == 0 and
+            hasattr(sae, 'resample_dead_neurons') and
+            all_activations is not None):
+            
+            # Sample a batch of activations for resampling
+            n_resample_batch = min(8192, len(all_activations))
+            resample_indices = torch.randperm(len(all_activations))[:n_resample_batch]
+            resample_batch = all_activations[resample_indices].to(device)
+            
+            n_resampled = sae.resample_dead_neurons(
+                activations=resample_batch,
+                optimizer=optimizer,
+            )
+            
+            if n_resampled > 0:
+                total_resampled += n_resampled
+                logger.info(f"  Step {global_step}: Resampled {n_resampled} dead neurons")
         
         # Track metrics
         total_loss += loss_dict['total_loss'].item()
@@ -224,6 +271,8 @@ def train_sae_epoch(
             if isinstance(dead_val, torch.Tensor):
                 dead_val = dead_val.item()
             postfix['dead%'] = f"{dead_val:.1f}"
+        if total_resampled > 0:
+            postfix['resampled'] = total_resampled
         progress_bar.set_postfix(postfix)
     
     metrics = {
@@ -236,7 +285,10 @@ def train_sae_epoch(
     if total_dead_pct > 0:
         metrics['dead_pct'] = total_dead_pct / num_batches
     
-    return metrics
+    if total_resampled > 0:
+        metrics['neurons_resampled'] = total_resampled
+    
+    return metrics, global_step
 
 
 def evaluate_sae(
@@ -489,6 +541,11 @@ def train_sae(
     # Get gradient clipping value
     clip_grad = getattr(cfg.sae, 'clip_grad', None)
     
+    # Get resampling interval
+    resample_interval = getattr(cfg.sae, 'resample_interval', 500)
+    if sae_type == "topk" and resample_interval > 0:
+        logger.info(f"Neuron resampling enabled every {resample_interval} steps")
+    
     # Initialize wandb
     if cfg.wandb.mode != 'disabled':
         wandb.init(
@@ -502,14 +559,14 @@ def train_sae(
     # Training loop
     logger.info(f"Training SAE for {cfg.sae.epochs} epochs...")
     best_val_loss = float('inf')
+    global_step = 0
+    total_neurons_resampled = 0
 
-    resample_interval = getattr(cfg.sae, 'resample_interval', 500)
-    
     for epoch in range(cfg.sae.epochs):
         logger.info(f"Epoch {epoch + 1}/{cfg.sae.epochs}")
         
         # Train
-        train_metrics = train_sae_epoch(
+        train_metrics, global_step = train_sae_epoch(
             sae=sae,
             dataloader=train_act_loader,
             optimizer=optimizer,
@@ -517,7 +574,12 @@ def train_sae(
             clip_grad=clip_grad,
             resample_interval=resample_interval,
             all_activations=train_acts,
+            global_step=global_step,
         )
+        
+        # Track total resampled
+        if 'neurons_resampled' in train_metrics:
+            total_neurons_resampled += train_metrics['neurons_resampled']
         
         logger.info(f"Train Loss: {train_metrics['loss']:.4f}")
         logger.info(f"Train Reconstruction Loss: {train_metrics['reconstruction_loss']:.4f}")
@@ -527,6 +589,8 @@ def train_sae(
             logger.info(f"Train Aux Loss: {train_metrics['sparsity_loss']:.4f}")
             logger.info(f"Train Dead Features: {train_metrics['dead_pct']:.1f}%")
         logger.info(f"Train L0 Norm: {train_metrics['l0_norm']:.2f}")
+        if 'neurons_resampled' in train_metrics:
+            logger.info(f"Neurons Resampled This Epoch: {train_metrics['neurons_resampled']}")
         
         # Evaluate
         logger.info("Evaluating SAE...")
@@ -542,6 +606,7 @@ def train_sae(
         if cfg.wandb.mode != 'disabled':
             log_dict = {
                 'epoch': epoch,
+                'global_step': global_step,
                 'train/loss': train_metrics['loss'],
                 'train/reconstruction_loss': train_metrics['reconstruction_loss'],
                 'train/sparsity_loss': train_metrics['sparsity_loss'],
@@ -556,6 +621,9 @@ def train_sae(
                 log_dict['train/dead_pct'] = train_metrics['dead_pct']
             if 'dead_pct' in val_metrics:
                 log_dict['val/dead_pct'] = val_metrics['dead_pct']
+            if 'neurons_resampled' in train_metrics:
+                log_dict['train/neurons_resampled'] = train_metrics['neurons_resampled']
+            log_dict['total_neurons_resampled'] = total_neurons_resampled
             
             wandb.log(log_dict)
         
@@ -600,12 +668,14 @@ def train_sae(
     logger.info(f"Final Val L0 Norm: {final_metrics['l0_norm']:.2f}")
     if 'dead_pct' in final_metrics:
         logger.info(f"Final Val Dead Features: {final_metrics['dead_pct']:.1f}%")
+    logger.info(f"Total Neurons Resampled During Training: {total_neurons_resampled}")
     
     if cfg.wandb.mode != 'disabled':
         final_log = {
             'final/val_loss': final_metrics['loss'],
             'final/val_reconstruction_loss': final_metrics['reconstruction_loss'],
             'final/val_l0_norm': final_metrics['l0_norm'],
+            'final/total_neurons_resampled': total_neurons_resampled,
         }
         if 'dead_pct' in final_metrics:
             final_log['final/val_dead_pct'] = final_metrics['dead_pct']

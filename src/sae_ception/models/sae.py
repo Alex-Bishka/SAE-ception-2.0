@@ -259,6 +259,136 @@ class TopKSparseAutoencoder(nn.Module):
         normalized = mse / (target_variance + 1e-6)
         return normalized.mean()
 
+    @torch.no_grad()
+    def resample_dead_neurons(
+        self,
+        activations: torch.Tensor,
+        optimizer: torch.optim.Optimizer,
+        bias_resample_scale: float = 0.0,
+        encoder_resample_scale: float = 0.2,
+    ) -> int:
+        """
+        Resample dead neurons using high-loss examples (OpenAI approach).
+        
+        Args:
+            activations: Batch of input activations [batch, input_dim]
+            optimizer: Optimizer (to reset momentum for resampled neurons)
+            bias_resample_scale: Scale for resampled encoder bias (0 = zero)
+            encoder_resample_scale: Scale for encoder weights relative to avg alive norm
+            
+        Returns:
+            Number of neurons resampled
+        """
+        # 1. Find dead neurons
+        dead_mask = self.stats_last_nonzero > self.dead_steps_threshold
+        n_dead = dead_mask.sum().item()
+        
+        if n_dead == 0:
+            return 0
+        
+        dead_indices = torch.where(dead_mask)[0]
+        
+        # 2. Compute per-example reconstruction loss
+        recon, _, _ = self(activations)
+        per_example_loss = (recon - activations).pow(2).mean(dim=-1)  # [batch]
+        
+        # 3. Sample examples proportional to squared loss
+        # (high-loss examples are underrepresented by current features)
+        sampling_probs = per_example_loss.pow(2)
+        sampling_probs = sampling_probs / sampling_probs.sum()
+        
+        # Sample with replacement if we need more dead neurons than examples
+        n_samples = min(n_dead, len(activations))
+        sampled_indices = torch.multinomial(
+            sampling_probs, 
+            num_samples=n_samples, 
+            replacement=(n_dead > len(activations))
+        )
+        
+        # If we have more dead neurons than samples, cycle through
+        if n_dead > n_samples:
+            sampled_indices = sampled_indices.repeat(
+                (n_dead // n_samples) + 1
+            )[:n_dead]
+        
+        sampled_activations = activations[sampled_indices]  # [n_dead, input_dim]
+        
+        # 4. Center the sampled activations (subtract pre_bias)
+        centered = sampled_activations - self.pre_bias
+        
+        # 5. Compute average encoder norm of alive neurons for scaling
+        alive_mask = ~dead_mask
+        if alive_mask.any():
+            alive_encoder_norms = self.encoder.weight[alive_mask].norm(dim=1)
+            avg_alive_norm = alive_encoder_norms.mean().item()
+        else:
+            avg_alive_norm = 1.0
+        
+        # 6. Reinitialize dead neurons
+        for i, dead_idx in enumerate(dead_indices):
+            direction = centered[i]
+            
+            # Normalize and scale encoder weight
+            direction_norm = direction.norm()
+            if direction_norm > 1e-6:
+                normalized_direction = direction / direction_norm
+            else:
+                # Fallback to random if example has zero norm
+                normalized_direction = torch.randn_like(direction)
+                normalized_direction = normalized_direction / normalized_direction.norm()
+            
+            # Set encoder row (scaled to average alive norm)
+            self.encoder.weight.data[dead_idx] = (
+                normalized_direction * avg_alive_norm * encoder_resample_scale
+            )
+            
+            # Set decoder column to same direction (will be normalized after)
+            self.decoder.weight.data[:, dead_idx] = normalized_direction
+            
+            # Reset encoder bias for this neuron
+            self.latent_bias.data[dead_idx] = bias_resample_scale
+            
+            # Reset dead tracking counter
+            self.stats_last_nonzero[dead_idx] = 0
+        
+        # 7. Normalize decoder (maintains unit norm constraint)
+        self.normalize_decoder_()
+        
+        # 8. Reset optimizer state for resampled neurons
+        self._reset_optimizer_state(optimizer, dead_indices)
+        
+        return n_dead
+
+    def _reset_optimizer_state(
+        self, 
+        optimizer: torch.optim.Optimizer, 
+        neuron_indices: torch.Tensor
+    ):
+        """Reset optimizer momentum/state for specific neurons."""
+        neuron_indices = neuron_indices.tolist()
+        
+        for group in optimizer.param_groups:
+            for param in group['params']:
+                if param not in optimizer.state:
+                    continue
+                    
+                state = optimizer.state[param]
+                
+                # Handle Adam optimizer state
+                if 'exp_avg' in state:
+                    # Check if this is encoder weight [hidden, input]
+                    if param.shape == self.encoder.weight.shape:
+                        state['exp_avg'][neuron_indices] = 0
+                        state['exp_avg_sq'][neuron_indices] = 0
+                    # Check if this is decoder weight [input, hidden]
+                    elif param.shape == self.decoder.weight.shape:
+                        state['exp_avg'][:, neuron_indices] = 0
+                        state['exp_avg_sq'][:, neuron_indices] = 0
+                    # Check if this is latent_bias [hidden]
+                    elif param.shape == self.latent_bias.shape:
+                        state['exp_avg'][neuron_indices] = 0
+                        state['exp_avg_sq'][neuron_indices] = 0
+
 
 class TopKSparseAutoencoderSTE(TopKSparseAutoencoder):
     """

@@ -24,6 +24,78 @@ from ..sharpening import get_sharpener
 logger = get_logger(__name__)
 
 
+def freeze_layers_before_target(
+    model: nn.Module,
+    target_layer: int,
+) -> int:
+    """
+    Freeze all layers before the target layer.
+    
+    Only the target layer and classifier head remain trainable.
+    This is the approach used in the original SAE-ception paper.
+    
+    Args:
+        model: The model to freeze layers in
+        target_layer: Target layer index (e.g., -1 for last layer)
+        
+    Returns:
+        Number of layers frozen
+    """
+    # Find the transformer layers
+    if hasattr(model, 'transformer') and hasattr(model.transformer, 'h'):
+        # GPT-2 style: model.transformer.h
+        layers = model.transformer.h
+        embeddings = model.transformer.wte, model.transformer.wpe
+        ln_f = model.transformer.ln_f
+    elif hasattr(model, 'gpt_neox') and hasattr(model.gpt_neox, 'layers'):
+        # GPT-NeoX style
+        layers = model.gpt_neox.layers
+        embeddings = [model.gpt_neox.embed_in]
+        ln_f = model.gpt_neox.final_layer_norm
+    elif hasattr(model, 'model') and hasattr(model.model, 'layers'):
+        # LLaMA style
+        layers = model.model.layers
+        embeddings = [model.model.embed_tokens]
+        ln_f = model.model.norm
+    else:
+        raise ValueError(
+            f"Cannot identify transformer layers for model type {type(model).__name__}. "
+            f"Supported: GPT-2, GPT-NeoX, LLaMA style architectures."
+        )
+    
+    n_layers = len(layers)
+    
+    # Convert negative index to positive
+    if target_layer < 0:
+        target_layer_idx = n_layers + target_layer
+    else:
+        target_layer_idx = target_layer
+    
+    # Freeze embeddings
+    for emb in embeddings:
+        if emb is not None:
+            for param in emb.parameters():
+                param.requires_grad = False
+    
+    # Freeze all layers BEFORE the target layer
+    n_frozen = 0
+    for idx, layer in enumerate(layers):
+        if idx < target_layer_idx:
+            for param in layer.parameters():
+                param.requires_grad = False
+            n_frozen += 1
+    
+    # Log what's trainable
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    total_params = sum(p.numel() for p in model.parameters())
+    
+    logger.info(f"Frozen {n_frozen}/{n_layers} transformer layers (layers 0-{target_layer_idx - 1})")
+    logger.info(f"Trainable: layer {target_layer_idx}, final LN, classifier head")
+    logger.info(f"Trainable parameters: {trainable_params:,} / {total_params:,} ({100*trainable_params/total_params:.1f}%)")
+    
+    return n_frozen
+
+
 def compute_auxiliary_loss(
     activations: torch.Tensor,
     targets: torch.Tensor,
@@ -170,6 +242,10 @@ def train_with_auxiliary_loss(
     """
     Train model with auxiliary loss from sharpened SAE features.
     
+    IMPORTANT: Only the target layer and classifier head are trained.
+    All layers before the target layer are frozen. This is the approach
+    used in the original SAE-ception paper.
+    
     Args:
         cfg: Hydra configuration
         prev_cycle: Previous cycle number (loads model/SAE from this cycle)
@@ -221,6 +297,13 @@ def train_with_auxiliary_loss(
                     f"Searched: {checkpoint_dir} and {outputs_dir}"
                 )
     model.to(device)
+    
+    # ==========================================================================
+    # FREEZE LAYERS BEFORE TARGET (SAE-ception paper approach)
+    # ==========================================================================
+    logger.info("Freezing layers before target layer...")
+    target_layer = int(cfg.model.target_layer)
+    n_frozen = freeze_layers_before_target(model, target_layer)
     
     # Load SAE
     logger.info(f"Loading SAE from cycle {prev_cycle}")
@@ -294,9 +377,10 @@ def train_with_auxiliary_loss(
         'labels': train_labels,
     }
     
-    # Setup optimizer
+    # Setup optimizer - ONLY for trainable parameters
+    trainable_params = [p for p in model.parameters() if p.requires_grad]
     optimizer = AdamW(
-        model.parameters(),
+        trainable_params,
         lr=cfg.model.learning_rate,
         weight_decay=cfg.model.weight_decay,
     )
