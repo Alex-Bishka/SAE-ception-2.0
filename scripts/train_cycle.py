@@ -54,6 +54,10 @@ def evaluate_cycle(
     """
     Comprehensive evaluation of a cycle.
     
+    Uses two extraction strategies:
+    - Token-level: For SAE quality metrics (dead features %)
+    - Sequence-level (final token): For classification metrics (probe, clustering)
+    
     Args:
         cfg: Configuration
         model: Trained model
@@ -80,38 +84,182 @@ def evaluate_cycle(
     val_loader = dataloaders['val']
     train_loader = dataloaders['train']
     
-    # Extract activations
-    logger.info("Extracting activations for evaluation...")
-    train_acts, train_labels = extract_activations_from_model(
+    token_level = getattr(cfg.sae, 'token_level', True)
+    
+    # =========================================================================
+    # SEQUENCE-LEVEL EXTRACTION (for classification metrics)
+    # =========================================================================
+    logger.info("Extracting FINAL token activations for classification metrics...")
+    train_acts_seq, train_labels_seq = extract_activations_from_model(
         model, train_loader, str(cfg.model.target_layer), device, 'last'
     )
-    val_acts, val_labels = extract_activations_from_model(
+    val_acts_seq, val_labels_seq = extract_activations_from_model(
         model, val_loader, str(cfg.model.target_layer), device, 'last'
     )
+    logger.info(f"Sequence-level: train={train_acts_seq.shape}, val={val_acts_seq.shape}")
     
-    # Get SAE sparse codes
-    logger.info("Computing SAE sparse codes...")
+    # Compute sparse codes for sequence-level (small, fits in memory)
     sae.eval()
     with torch.no_grad():
-        sparse_train = sae.encode(train_acts.to(device)).cpu()
-        sparse_val = sae.encode(val_acts.to(device)).cpu()
+        sparse_train_seq = sae.encode(train_acts_seq.to(device)).cpu()
+        sparse_val_seq = sae.encode(val_acts_seq.to(device)).cpu()
     
-    # Full evaluation
-    results = evaluate_model_and_sae(
-        model=model,
-        sae=sae,
-        train_dataloader=train_loader,
-        val_dataloader=val_loader,
-        train_activations=train_acts,
-        train_labels=train_labels,
-        val_activations=val_acts,
-        val_labels=val_labels,
-        sparse_codes_train=sparse_train,
-        sparse_codes_val=sparse_val,
-        device=device,
+    # =========================================================================
+    # TOKEN-LEVEL EXTRACTION (for SAE quality / dead features)
+    # =========================================================================
+    if token_level:
+        logger.info("Extracting ALL token activations for SAE quality metrics...")
+        from sae_ception.utils.data import extract_activations_all_tokens
+        
+        # Only need val set for dead feature calculation
+        val_acts_tok, _, _ = extract_activations_all_tokens(
+            model, val_loader, str(cfg.model.target_layer), device
+        )
+        logger.info(f"Token-level val: {val_acts_tok.shape}")
+        
+        # Compute dead features % using token-level activations (batched)
+        logger.info("Computing SAE quality metrics on token-level activations...")
+        sae_quality = compute_sae_quality_batched(sae, val_acts_tok, device)
+    else:
+        # Use sequence-level for SAE quality too
+        from sae_ception.evaluation import evaluate_sae_quality
+        sae_quality = evaluate_sae_quality(sae, val_acts_seq, device)
+    
+    # =========================================================================
+    # COMPUTE ALL OTHER METRICS (using sequence-level data)
+    # =========================================================================
+    from sae_ception.evaluation import (
+        evaluate_classification_accuracy,
+        train_linear_probe,
+        compute_monosemanticity_metrics,
+        compute_all_clustering_metrics,
+        compute_sparsity_metrics,
+        k_sparse_probe_accuracy,
     )
     
+    results = {}
+    
+    # 1. Task performance
+    print("Evaluating task performance...")
+    task_metrics = evaluate_classification_accuracy(model, val_loader, device)
+    results.update({f'task_{k}': v for k, v in task_metrics.items()})
+    
+    # 2. Linear probe on SAE features
+    print("Training linear probe on SAE features...")
+    probe_metrics = train_linear_probe(
+        sparse_train_seq, train_labels_seq,
+        sparse_val_seq, val_labels_seq,
+    )
+    results.update({f'probe_{k}': v for k, v in probe_metrics.items()})
+    
+    # 3. K-sparse probing
+    print("Evaluating k-sparse probe accuracy...")
+    k_sparse_metrics = k_sparse_probe_accuracy(
+        sparse_val_seq, val_labels_seq,
+        k_values=[1, 5, 10, 25, 50],
+    )
+    results.update(k_sparse_metrics)
+    
+    # 4. SAE quality (from token-level if enabled)
+    results.update({f'sae_{k}': v for k, v in sae_quality.items()})
+    
+    # 5. Monosemanticity of base activations
+    print("Computing monosemanticity metrics (base model)...")
+    mono_base = compute_monosemanticity_metrics(val_acts_seq, val_labels_seq)
+    results.update({f'base_{k}': v for k, v in mono_base.items()})
+    
+    # 6. Monosemanticity of SAE features
+    print("Computing monosemanticity metrics (SAE features)...")
+    mono_sae = compute_monosemanticity_metrics(sparse_val_seq, val_labels_seq)
+    results.update({f'sae_features_{k}': v for k, v in mono_sae.items()})
+    
+    # 7. Clustering metrics
+    print("Computing clustering metrics...")
+    clustering = compute_all_clustering_metrics(sparse_val_seq, val_labels_seq)
+    results.update({f'clustering_{k}': v for k, v in clustering.items()})
+    
+    # 8. Sparsity metrics (from sequence-level sparse codes)
+    print("Computing sparsity metrics...")
+    sparsity = compute_sparsity_metrics(sparse_val_seq)
+    results.update({f'sparsity_{k}': v for k, v in sparsity.items()})
+    
     return results
+
+
+def compute_sae_quality_batched(
+    sae: torch.nn.Module,
+    activations: torch.Tensor,
+    device: str = 'cuda',
+    batch_size: int = 4096,
+) -> dict:
+    """
+    Compute SAE quality metrics in batches to avoid OOM.
+    
+    This is the token-level version that correctly computes dead features %.
+    """
+    import numpy as np
+    
+    sae.eval()
+    sae.to(device)
+    
+    all_recon_loss = []
+    all_explained_var = []
+    all_l0 = []
+    
+    # Track which features ever fire (for dead feature %)
+    n_features = sae.hidden_dim
+    feature_ever_fired = torch.zeros(n_features, dtype=torch.bool)
+    
+    n_samples = len(activations)
+    
+    with torch.no_grad():
+        for i in range(0, n_samples, batch_size):
+            batch = activations[i:i+batch_size].to(device)
+            
+            # Forward pass
+            reconstruction, sparse_code, _ = sae(batch)
+            
+            # Reconstruction loss
+            recon_loss = torch.nn.functional.mse_loss(reconstruction, batch)
+            all_recon_loss.append(recon_loss.item())
+            
+            # Explained variance
+            var_original = batch.var(dim=0).mean()
+            var_residual = (batch - reconstruction).var(dim=0).mean()
+            explained_var = 1 - (var_residual / (var_original + 1e-8))
+            all_explained_var.append(explained_var.item())
+            
+            # Sparsity (L0)
+            l0 = (sparse_code > 0).float().sum(dim=-1).mean()
+            all_l0.append(l0.item())
+            
+            # Track which features fired in this batch
+            batch_fired = (sparse_code > 0).any(dim=0).cpu()
+            feature_ever_fired |= batch_fired
+            
+            # Clear GPU cache periodically
+            if i % (batch_size * 10) == 0 and i > 0:
+                torch.cuda.empty_cache()
+    
+    # Compute dead features %
+    dead_features_pct = 100.0 * (~feature_ever_fired).float().mean().item()
+    
+    # Compute feature usage entropy
+    # (This is approximate - we'd need to track full counts for exact entropy)
+    n_active = feature_ever_fired.sum().item()
+    if n_active > 0:
+        # Approximate entropy assuming uniform distribution among active features
+        feature_usage_entropy = np.log(n_active)
+    else:
+        feature_usage_entropy = 0.0
+    
+    return {
+        'reconstruction_loss': float(np.mean(all_recon_loss)),
+        'explained_variance': float(np.mean(all_explained_var)),
+        'mean_l0': float(np.mean(all_l0)),
+        'dead_features_pct': float(dead_features_pct),
+        'feature_usage_entropy': float(feature_usage_entropy),
+    }
 
 
 def load_pretrained_model_for_eval(cfg):
