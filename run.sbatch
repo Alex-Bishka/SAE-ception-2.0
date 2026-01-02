@@ -2,8 +2,8 @@
 #SBATCH --job-name=saeception
 #SBATCH --partition=gpu
 #SBATCH --gpus=1                 # if your cluster uses gres: use --gres=gpu:1 instead
-#SBATCH --time=10:00:00
-#SBATCH --cpus-per-task=2
+#SBATCH --time=14:00:00
+#SBATCH --cpus-per-task=4
 #SBATCH --mem=32G
 #SBATCH --output=slurm-%j.out
 
@@ -48,35 +48,60 @@ if torch.cuda.is_available():
     print("gpu:", torch.cuda.get_device_name(0))
 PY
 
-# ---- YOUR TRAIN COMMAND ----
+# ---- gp2_small real run ----
 # uv run python scripts/train_cycle.py -m \
 #     model=gpt2_small \
 #     dataset=sst2 \
 #     cycle.current=0 \
-#     cycle.max_cycles=2 \
+#     cycle.max_cycles=3 \
 #     model.epochs_per_cycle=2 \
+#     sharpening.top_k_pct=0.50,1.00,1.50,2.00 \
+#     sae=topk \
 #     sae.epochs=3 \
-#     sae.l1_penalty=3e-4,5e-4,7e-4,1e-3 \
-#     sharpening.top_k_pct=0.25 \
-#     cycle.aux_loss_weight=0.01 \
-#     wandb.mode=online
+#     sae.k=100,150,200,250 \
+#     sae.token_level=true \
+#     clear_cache=true \
+    # cycle.aux_loss_weight=0.01,0.05,0.10,0.15,0.20,0.25,0.30 \
+#     start_from=finetuned \
+#     wandb.mode=enabled
 # ----------------------------
 
-# ---- TESTING PARAMS ----
+# find best k for gpt2 small
+# uv run python scripts/train_cycle.py -m \
+#     model=gpt2_small \
+#     dataset=sst2 \
+#     cycle.current=0 \
+#     cycle.max_cycles=1 \
+#     model.epochs_per_cycle=2 \
+#     sharpening.top_k_pct=1.00 \
+#     sae=topk \
+#     sae.expansion_factor=8 \
+#     sae.epochs=5 \
+#     sae.k=256,384,512,768,1000 \
+#     sae.resample_interval=100 \
+#     sae.token_level=true \
+#     start_from=finetuned \
+#     wandb.mode=online
+
+# smoke test on gpt2_small
 uv run python scripts/train_cycle.py -m \
     model=gpt2_small \
     dataset=sst2 \
     cycle.current=0 \
-    cycle.max_cycles=0 \
+    cycle.max_cycles=1 \
     model.epochs_per_cycle=2 \
-    sae.epochs=5 \
-    sae.expansion_factor=4 \
-    sae.l1_penalty=1e-4,2e-4,3e-4 \
-    sharpening.top_k_pct=0.25 \
-    cycle.aux_loss_weight=0.01 \
-    wandb.mode=online
-# ----------------------------
+    sharpening.top_k_pct=1.00 \
+    sae=topk \
+    sae.epochs=3 \
+    sae.k=400 \
+    clear_cache=true \
+    sae.token_level=true \
+    start_from=baseline \
+    wandb.mode=disabled
 
+# pythyia 70m dims: TopK SAE: 512 -> 4096 -> 512
+# 0.5% of 4096 is about 20 active features
+# 200 is about 4.88% of sparse codes
 # ---- SMOKE TEST SCRIPT ----
 # uv run python scripts/train_cycle.py -m \
 #     model=gpt2_small \
@@ -86,7 +111,24 @@ uv run python scripts/train_cycle.py -m \
 #     cycle.current=0 \
 #     cycle.max_cycles=1 \
 #     model.epochs_per_cycle=1 \
-#     sae.epochs=1 \
-#     sae.l1_penalty=5e-4,1e-3 \
+#     sharpening.top_k_pct=0.50 \
+#     sae=topk \
+#     sae.epochs=2 \
+#     sae.k=100 \
+#     sae.resample_interval=100 \
+#     sae.token_level=true \
+#     clear_cache=true \
+#     start_from=baseline \
 #     wandb.mode=disabled
 # ----------------------------
+
+# SAE bench testing:
+# uv run python scripts/run_saebench.py \
+#     model=gpt2_small \
+#     model.hf_path=EleutherAI/pythia-70m \
+#     model.hidden_size=512 \
+#     dataset=sst2 \
+#     sae=topk \
+#     checkpoint_dir=/home1/abishka@hmc.edu/scratch/saeception/run_20033/multirun/2025-12-01/18-35-39/0/checkpoints \
+#     cycle_to_eval=0 \
+#     n_candidates=100
