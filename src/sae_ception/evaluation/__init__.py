@@ -32,6 +32,10 @@ from .saebench import (
     evaluate_sae_saebench,
 )
 
+from .lm_metrics import (
+    evaluate_perplexity,
+    evaluate_perplexity_with_intervention,
+)
 
 __all__ = [
     # Interpretability
@@ -58,4 +62,7 @@ __all__ = [
     # SAEBench
     'compute_first_letter_absorption',
     'evaluate_sae_saebench',
+    # LM Metrics
+    'evaluate_perplexity',
+    'evaluate_perplexity_with_intervention',
 ]

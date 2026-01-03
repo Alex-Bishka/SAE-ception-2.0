@@ -1,0 +1,12 @@
+name: wikitext
+hf_path: wikitext
+hf_name: wikitext-103-v1
+
+# For causal LM
+batch_size: 8
+max_length: 1024
+num_workers: 4
+
+# Evaluation
+eval_split: test
+max_eval_samples: null  # null = use all

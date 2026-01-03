@@ -199,3 +199,152 @@ def extract_cls_token_activation(activation: torch.Tensor) -> torch.Tensor:
         [CLS] activation of shape [batch, hidden_dim]
     """
     return extract_final_token_activation(activation, token_idx=0)
+
+# =============================================================================
+# INTERVENTION HOOKS (NEW - for activation replacement)
+# =============================================================================
+
+class ActivationIntervention:
+    """
+    Context manager for intervening on model activations during forward pass.
+    
+    Unlike ActivationExtractor (read-only), this MODIFIES activations in-place.
+    
+    Example:
+        >>> def sharpen_fn(acts):
+        ...     # acts: [batch, seq, hidden]
+        ...     return sae.decode(sharpen(sae.encode(acts)))
+        >>> 
+        >>> with ActivationIntervention(model, 'gpt_neox.layers.3', sharpen_fn):
+        ...     outputs = model(input_ids)  # Uses modified activations
+    """
+    
+    def __init__(
+        self, 
+        model: nn.Module, 
+        layer_name: str, 
+        intervention_fn: Callable[[torch.Tensor], torch.Tensor],
+        enabled: bool = True,
+    ):
+        """
+        Args:
+            model: Model to intervene on
+            layer_name: Layer to target (e.g., 'gpt_neox.layers.3' or '3')
+            intervention_fn: Function that takes activations and returns modified activations
+            enabled: Whether intervention is active (useful for toggling)
+        """
+        self.model = model
+        self.layer_name = layer_name
+        self.intervention_fn = intervention_fn
+        self.enabled = enabled
+        self.handle = None
+        self._original_output = None  # For debugging/comparison
+    
+    def _get_target_layer(self) -> nn.Module:
+        """Resolve layer name to module."""
+        # Handle integer indices
+        if self.layer_name.lstrip('-').isdigit():
+            layer_idx = int(self.layer_name)
+            
+            # Try different architectures
+            if hasattr(self.model, 'gpt_neox') and hasattr(self.model.gpt_neox, 'layers'):
+                return self.model.gpt_neox.layers[layer_idx]
+            elif hasattr(self.model, 'transformer') and hasattr(self.model.transformer, 'h'):
+                return self.model.transformer.h[layer_idx]
+            elif hasattr(self.model, 'model') and hasattr(self.model.model, 'layers'):
+                return self.model.model.layers[layer_idx]
+            else:
+                raise ValueError(f"Cannot find layers for model type {type(self.model)}")
+        else:
+            # Handle dotted path names
+            return dict(self.model.named_modules())[self.layer_name]
+    
+    def _intervention_hook(self, module, input, output):
+        """Hook that modifies layer output."""
+        # Handle tuple outputs (common in transformers)
+        if isinstance(output, tuple):
+            hidden_states = output[0]
+            rest = output[1:]
+        else:
+            hidden_states = output
+            rest = None
+        
+        # Store original for debugging
+        self._original_output = hidden_states.detach().clone()
+        
+        # Apply intervention if enabled
+        if self.enabled:
+            modified = self.intervention_fn(hidden_states)
+        else:
+            modified = hidden_states
+        
+        # Reconstruct output format
+        if rest is not None:
+            return (modified,) + rest
+        return modified
+    
+    def __enter__(self):
+        target_layer = self._get_target_layer()
+        self.handle = target_layer.register_forward_hook(self._intervention_hook)
+        return self
+    
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if self.handle is not None:
+            self.handle.remove()
+            self.handle = None
+    
+    def get_original_output(self) -> Optional[torch.Tensor]:
+        """Get the unmodified output from last forward pass (for debugging)."""
+        return self._original_output
+
+
+def create_sae_intervention(
+    sae: nn.Module,
+    k_sharp: int,
+    device: str = 'cuda',
+) -> Callable[[torch.Tensor], torch.Tensor]:
+    """
+    Create an intervention function that applies SAE sharpening.
+    
+    Args:
+        sae: Trained SAE
+        k_sharp: Number of top features to keep per token
+        device: Device to run on
+        
+    Returns:
+        Function: activations -> sharpened_reconstructions
+    """
+    sae.eval()
+    sae.to(device)
+    
+    def intervention_fn(activations: torch.Tensor) -> torch.Tensor:
+        """
+        Apply SAE encode -> sharpen -> decode.
+        
+        Args:
+            activations: [batch, seq_len, hidden_dim]
+        Returns:
+            sharpened: [batch, seq_len, hidden_dim]
+        """
+        original_shape = activations.shape
+        batch_size, seq_len, hidden_dim = original_shape
+        
+        # Flatten to [batch * seq, hidden]
+        flat_acts = activations.view(-1, hidden_dim)
+        
+        with torch.no_grad():
+            # Encode
+            sparse_codes = sae.encode(flat_acts)  # [batch * seq, sae_hidden]
+            
+            # Sharpen: keep only top-k per token
+            topk_vals, topk_idx = torch.topk(sparse_codes, k=k_sharp, dim=-1)
+            sharpened_codes = torch.zeros_like(sparse_codes)
+            sharpened_codes.scatter_(-1, topk_idx, topk_vals)
+            
+            # Decode
+            reconstructed = sae.decode(sharpened_codes)  # [batch * seq, hidden]
+        
+        # Reshape back
+        return reconstructed.view(original_shape)
+    
+    return intervention_fn

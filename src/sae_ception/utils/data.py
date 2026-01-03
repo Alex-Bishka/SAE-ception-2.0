@@ -214,6 +214,7 @@ def extract_activations_all_tokens(
     all_activations = []
     all_token_ids = []
     all_labels = []
+    has_labels = None  # Will be determined from first batch
     
     iterator = tqdm(dataloader, desc="Extracting all-token activations") if show_progress else dataloader
     
@@ -221,7 +222,16 @@ def extract_activations_all_tokens(
         for batch in iterator:
             input_ids = batch['input_ids'].to(device)      # [batch, seq_len]
             attention_mask = batch['attention_mask'].to(device)  # [batch, seq_len]
-            labels = batch['labels']  # [batch]
+            if attention_mask is not None:
+                attention_mask = attention_mask.to(device)  # [batch, seq_len]
+            else:
+                # If no attention mask, assume all tokens are valid
+                attention_mask = torch.ones_like(input_ids)
+
+            # Check if labels exist (first batch only)
+            labels = batch.get('labels', None)
+            if has_labels is None:
+                has_labels = 'labels' in batch
             
             batch_size, seq_len = input_ids.shape
             
@@ -248,13 +258,19 @@ def extract_activations_all_tokens(
                     
                     all_activations.append(activations[b, t].cpu())
                     all_token_ids.append(input_ids[b, t].cpu())
-                    all_labels.append(labels[b])  # Inherit sequence label
+                    
+                    if has_labels:
+                        all_labels.append(labels[b])
+
+    result_activations = torch.stack(all_activations)
+    result_token_ids = torch.stack(all_token_ids)
     
-    return (
-        torch.stack(all_activations),
-        torch.stack(all_token_ids),
-        torch.stack(all_labels),
-    )
+    if has_labels and all_labels:
+        result_labels = torch.stack(all_labels)
+    else:
+        result_labels = None
+    
+    return result_activations, result_token_ids, result_labels
 
 
 def extract_activations_final_token(
@@ -422,5 +438,117 @@ def create_activation_dataloader(
         dataset,
         batch_size=batch_size,
         shuffle=shuffle,
+        pin_memory=True,
+    )
+
+# =============================================================================
+# CAUSAL LM DATA LOADING (NEW - for CPT experiments)
+# =============================================================================
+
+class CausalLMDataset(Dataset):
+    """Dataset for causal language modeling."""
+    
+    def __init__(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+    ):
+        """
+        Args:
+            input_ids: [N, seq_len] tokenized sequences
+            attention_mask: [N, seq_len] optional attention mask
+        """
+        self.input_ids = input_ids
+        self.attention_mask = attention_mask
+    
+    def __len__(self):
+        return len(self.input_ids)
+    
+    def __getitem__(self, idx):
+        item = {'input_ids': self.input_ids[idx]}
+        if self.attention_mask is not None:
+            item['attention_mask'] = self.attention_mask[idx]
+        return item
+
+
+def load_wikitext_for_eval(
+    tokenizer,
+    split: str = 'test',
+    max_length: int = 1024,
+    max_samples: Optional[int] = None,
+) -> CausalLMDataset:
+    """
+    Load WikiText-103 for perplexity evaluation.
+    
+    Args:
+        tokenizer: Tokenizer to use
+        split: 'train', 'validation', or 'test'
+        max_length: Maximum sequence length
+        max_samples: Limit number of samples (for quick tests)
+        
+    Returns:
+        CausalLMDataset
+    """
+    from datasets import load_dataset
+    
+    dataset = load_dataset('wikitext', 'wikitext-103-v1', split=split)
+    
+    # Filter empty lines and tokenize
+    texts = [t for t in dataset['text'] if len(t.strip()) > 0]
+    
+    if max_samples is not None:
+        texts = texts[:max_samples]
+    
+    # Tokenize
+    encodings = tokenizer(
+        texts,
+        max_length=max_length,
+        truncation=True,
+        padding='max_length',
+        return_tensors='pt',
+    )
+    
+    return CausalLMDataset(
+        input_ids=encodings['input_ids'],
+        attention_mask=encodings['attention_mask'],
+    )
+
+
+def create_causal_lm_dataloader(
+    tokenizer,
+    dataset_name: str = 'wikitext',
+    split: str = 'test',
+    batch_size: int = 8,
+    max_length: int = 1024,
+    max_samples: Optional[int] = None,
+    num_workers: int = 4,
+) -> DataLoader:
+    """
+    Create a dataloader for causal LM evaluation.
+    
+    Args:
+        tokenizer: Tokenizer
+        dataset_name: 'wikitext' (more datasets can be added)
+        split: Dataset split
+        batch_size: Batch size
+        max_length: Max sequence length
+        max_samples: Limit samples
+        num_workers: DataLoader workers
+        
+    Returns:
+        DataLoader
+    """
+    if dataset_name == 'wikitext':
+        dataset = load_wikitext_for_eval(
+            tokenizer, split, max_length, max_samples
+        )
+    else:
+        raise ValueError(f"Unknown dataset: {dataset_name}")
+    
+    return DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
         pin_memory=True,
     )

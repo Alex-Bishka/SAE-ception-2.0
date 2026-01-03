@@ -1,0 +1,15 @@
+name: pythia_70m
+hf_path: EleutherAI/pythia-70m
+hidden_size: 512
+num_layers: 6
+target_layer: 3  # Middle layer for intervention
+
+# Training parameters (for future CPT)
+learning_rate: 1e-4
+weight_decay: 0.1
+warmup_steps: 500
+max_grad_norm: 1.0
+
+# Fine-tuning
+epochs_per_cycle: 1
+gradient_accumulation_steps: 4
