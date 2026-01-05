@@ -552,3 +552,179 @@ def create_causal_lm_dataloader(
         num_workers=num_workers,
         pin_memory=True,
     )
+
+# =============================================================================
+# ADD THESE FUNCTIONS TO src/sae_ception/utils/data.py
+# Place after the create_causal_lm_dataloader function
+# =============================================================================
+
+def load_pile_streaming(
+    tokenizer,
+    max_length: int = 1024,
+    max_samples: Optional[int] = None,
+    seed: int = 42,
+) -> "IterableDataset":
+    """
+    Load The Pile dataset in streaming mode.
+    
+    Uses the uncopyrighted subset which is more accessible.
+    
+    Args:
+        tokenizer: Tokenizer to use
+        max_length: Maximum sequence length
+        max_samples: Limit number of samples (None = unlimited)
+        seed: Random seed for shuffling
+        
+    Returns:
+        IterableDataset that yields tokenized examples
+    """
+    from datasets import load_dataset
+    
+    # Load streaming dataset
+    dataset = load_dataset(
+        "monology/pile-uncopyrighted",
+        split="train",
+        streaming=True,
+    )
+    
+    # Shuffle with buffer
+    dataset = dataset.shuffle(seed=seed, buffer_size=10000)
+    
+    # Limit samples if specified
+    if max_samples is not None:
+        dataset = dataset.take(max_samples)
+    
+    def tokenize_fn(examples):
+        """Tokenize and prepare for causal LM."""
+        # Tokenize
+        tokenized = tokenizer(
+            examples["text"],
+            max_length=max_length,
+            truncation=True,
+            padding="max_length",
+            return_tensors="pt",
+        )
+        return {
+            "input_ids": tokenized["input_ids"].squeeze(0),
+            "attention_mask": tokenized["attention_mask"].squeeze(0),
+        }
+    
+    # Apply tokenization
+    dataset = dataset.map(tokenize_fn, remove_columns=["text", "meta"])
+    
+    return dataset
+
+
+def create_pile_dataloader(
+    tokenizer,
+    batch_size: int = 4,
+    max_length: int = 1024,
+    max_samples: Optional[int] = None,
+    num_workers: int = 0,  # Streaming doesn't work well with multiprocessing
+    seed: int = 42,
+) -> DataLoader:
+    """
+    Create a DataLoader for The Pile (streaming).
+    
+    Args:
+        tokenizer: Tokenizer
+        batch_size: Batch size
+        max_length: Max sequence length
+        max_samples: Limit samples (None = unlimited)
+        num_workers: DataLoader workers (0 recommended for streaming)
+        seed: Random seed
+        
+    Returns:
+        DataLoader that yields batches from The Pile
+    """
+    dataset = load_pile_streaming(
+        tokenizer=tokenizer,
+        max_length=max_length,
+        max_samples=max_samples,
+        seed=seed,
+    )
+    
+    # For streaming datasets, we need to use IterableDataset
+    # Can't use standard DataLoader shuffle
+    return DataLoader(
+        dataset,
+        batch_size=batch_size,
+        num_workers=num_workers,
+        pin_memory=True,
+    )
+
+
+def create_pile_dataloader_batched(
+    tokenizer,
+    batch_size: int = 4,
+    max_length: int = 1024,
+    max_samples: int = 100000,
+    num_workers: int = 4,
+    seed: int = 42,
+) -> DataLoader:
+    """
+    Create a DataLoader for The Pile by pre-loading samples.
+    
+    This loads a fixed number of samples into memory, which allows
+    proper shuffling and multi-worker loading. Better for training
+    but requires more memory.
+    
+    Args:
+        tokenizer: Tokenizer
+        batch_size: Batch size
+        max_length: Max sequence length
+        max_samples: Number of samples to load
+        num_workers: DataLoader workers
+        seed: Random seed
+        
+    Returns:
+        DataLoader with pre-loaded Pile samples
+    """
+    from datasets import load_dataset
+    import torch
+    
+    print(f"Loading {max_samples} samples from The Pile...")
+    
+    # Load streaming and take samples
+    dataset = load_dataset(
+        "monology/pile-uncopyrighted",
+        split="train",
+        streaming=True,
+    )
+    dataset = dataset.shuffle(seed=seed, buffer_size=10000)
+    
+    # Collect samples
+    texts = []
+    for i, example in enumerate(dataset):
+        if i >= max_samples:
+            break
+        if len(example["text"].strip()) > 0:
+            texts.append(example["text"])
+        if (i + 1) % 10000 == 0:
+            print(f"  Loaded {i + 1} samples...")
+    
+    print(f"Loaded {len(texts)} non-empty samples")
+    
+    # Tokenize all at once
+    print("Tokenizing...")
+    encodings = tokenizer(
+        texts,
+        max_length=max_length,
+        truncation=True,
+        padding="max_length",
+        return_tensors="pt",
+    )
+    
+    # Create dataset
+    pile_dataset = CausalLMDataset(
+        input_ids=encodings["input_ids"],
+        attention_mask=encodings["attention_mask"],
+    )
+    
+    return DataLoader(
+        pile_dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=num_workers,
+        pin_memory=True,
+    )

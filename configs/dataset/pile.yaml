@@ -1,0 +1,17 @@
+name: pile
+hf_path: EleutherAI/pile
+hf_name: null
+
+# For causal LM (CPT)
+batch_size: 4
+max_length: 1024
+num_workers: 4
+
+# Streaming (Pile is huge - 825GB)
+streaming: true
+max_train_samples: 100000  # Limit for initial experiments
+max_eval_samples: 1000
+
+# Eval dataset (separate)
+eval_dataset: wikitext
+eval_split: test

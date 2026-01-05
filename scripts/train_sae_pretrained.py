@@ -398,14 +398,47 @@ def main():
         args.epochs = 10
         logger.info("Quick mode: 10k samples, 10 epochs")
     
-    # Load model
-    logger.info(f"Loading {args.model}...")
-    tokenizer = AutoTokenizer.from_pretrained(args.model)
+    # Determine base model name for tokenizer
+    if args.model.endswith('.pt'):
+        # Load checkpoint to get base model name
+        checkpoint = torch.load(args.model, map_location='cpu')
+        base_model_name = checkpoint['config'].get('model_name', 'EleutherAI/pythia-70m')
+        logger.info(f"Loading tokenizer from base model: {base_model_name}")
+        tokenizer = AutoTokenizer.from_pretrained(base_model_name)
+    else:
+        logger.info(f"Loading tokenizer from: {args.model}")
+        tokenizer = AutoTokenizer.from_pretrained(args.model)
+
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     
-    model = AutoModelForCausalLM.from_pretrained(args.model)
-    model.to(args.device)
+    def load_model(model_path: str, device: str = 'cuda'):
+        """Load model from HuggingFace name or local checkpoint."""
+        
+        if model_path.endswith('.pt'):
+            # Local checkpoint from train_cpt.py
+            logger.info(f"Loading model from checkpoint: {model_path}")
+            checkpoint = torch.load(model_path, map_location=device)
+            
+            # Get the base model name from checkpoint config
+            base_model_name = checkpoint['config'].get('model_name', 'EleutherAI/pythia-70m')
+            
+            # Load architecture
+            model = AutoModelForCausalLM.from_pretrained(base_model_name)
+            
+            # Load trained weights
+            model.load_state_dict(checkpoint['model_state_dict'])
+            model.to(device)
+            
+            logger.info(f"  Loaded from base: {base_model_name}")
+        else:
+            # HuggingFace model name
+            logger.info(f"Loading model from HuggingFace: {model_path}")
+            model = AutoModelForCausalLM.from_pretrained(model_path)
+            model.to(device)
+        
+        return model
+    model = load_model(args.model, args.device)
     model.eval()
     
     hidden_size = model.config.hidden_size

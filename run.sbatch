@@ -48,125 +48,110 @@ if torch.cuda.is_available():
     print("gpu:", torch.cuda.get_device_name(0))
 PY
 
-# =============================================================================
-# Comprehensive SAE Sweep (with smart k filtering)
-# =============================================================================
+# ============================================================
+# SAE-ception e2e smoke test
+# ============================================================
+echo "========================================"
+echo "SAE-CEPTION END-TO-END SMOKE TEST"
+echo "========================================"
 
-TRAIN_K_VALUES=(64 128 256 384 512 768 1024)
-ALL_SHARP_K=(32 64 128 192 256 384 512 768 1024)
+# Parameters for smoke test
+SAE_SAMPLES=5000
+SAE_EPOCHS=15
+CPT_SAMPLES=1000
+CPT_EPOCHS=1
+SAE_K=768
+SHARP_K=512
 
-# Create results summary file
-SUMMARY_FILE="$WORKDIR/sweep_summary.csv"
-echo "train_k,sharp_k,perplexity,degradation_pct" > "$SUMMARY_FILE"
+mkdir -p checkpoints
 
-for train_k in "${TRAIN_K_VALUES[@]}"; do
-    echo ""
-    echo "========================================"
-    echo "Training SAE with k=$train_k"
-    echo "========================================"
-    
-    SAE_CHECKPOINT="$WORKDIR/checkpoints/sae_k${train_k}.pt"
-    
-    uv run python scripts/train_sae_pretrained.py \
-        --model EleutherAI/pythia-70m \
-        --layer 3 \
-        --k "$train_k" \
-        --epochs 30 \
-        --samples 100000 \
-        --output "$SAE_CHECKPOINT"
-    
-    if [ ! -f "$SAE_CHECKPOINT" ]; then
-        echo "ERROR: SAE checkpoint not created for k=$train_k"
-        continue
-    fi
-    
-    # Build list of valid sharp_k values (<= train_k)
-    VALID_SHARP_K=""
-    for sharp_k in "${ALL_SHARP_K[@]}"; do
-        if [ "$sharp_k" -le "$train_k" ]; then
-            if [ -z "$VALID_SHARP_K" ]; then
-                VALID_SHARP_K="$sharp_k"
-            else
-                VALID_SHARP_K="$VALID_SHARP_K,$sharp_k"
-            fi
-        fi
-    done
-    
-    echo ""
-    echo "Testing interventions for k=$train_k SAE..."
-    echo "Valid sharp_k values: $VALID_SHARP_K"
-    
-    uv run python scripts/intervention_baseline.py \
-        --model EleutherAI/pythia-70m \
-        --layer 3 \
-        --k_values "$VALID_SHARP_K" \
-        --sae_checkpoint "$SAE_CHECKPOINT" \
-        --sae_k "$train_k" \
-        --max_samples 500 \
-        --output "$WORKDIR/results_k${train_k}.json"
-    
-    echo "Completed k=$train_k"
-done
+# ============================================================
+# Step 1: Train SAE on pretrained model
+# ============================================================
+echo ""
+echo "Step 1: Training SAE on pretrained Pythia-70M..."
+uv run python scripts/train_sae_pretrained.py \
+    --model EleutherAI/pythia-70m \
+    --layer 3 \
+    --k $SAE_K \
+    --epochs $SAE_EPOCHS \
+    --samples $SAE_SAMPLES \
+    --output checkpoints/sae_k${SAE_K}.pt
 
-# =============================================================================
-# Combine results into summary
-# =============================================================================
+# ============================================================
+# Step 2: CPT WITHOUT aux loss (control)
+# ============================================================
+echo ""
+echo "Step 2: CPT without aux loss (control)..."
+uv run python scripts/train_cpt.py \
+    --model EleutherAI/pythia-70m \
+    --layer 3 \
+    --sae_checkpoint checkpoints/sae_k${SAE_K}.pt \
+    --sae_k $SAE_K \
+    --k_sharp $SHARP_K \
+    --aux_weight 0.0 \
+    --train_samples $CPT_SAMPLES \
+    --epochs $CPT_EPOCHS \
+    --output checkpoints/model_cpt_no_aux.pt
+
+# ============================================================
+# Step 3: CPT WITH aux loss (SAE-ception)
+# ============================================================
+echo ""
+echo "Step 3: CPT with aux loss (SAE-ception)..."
+uv run python scripts/train_cpt.py \
+    --model EleutherAI/pythia-70m \
+    --layer 3 \
+    --sae_checkpoint checkpoints/sae_k${SAE_K}.pt \
+    --sae_k $SAE_K \
+    --k_sharp $SHARP_K \
+    --aux_weight 0.01 \
+    --train_samples $CPT_SAMPLES \
+    --epochs $CPT_EPOCHS \
+    --output checkpoints/model_cpt_with_aux.pt
+
+# ============================================================
+# Step 4: Structure Check - Train SAE on control model
+# ============================================================
+echo ""
+echo "Step 4: Training SAE on control model..."
+uv run python scripts/train_sae_pretrained.py \
+    --model checkpoints/model_cpt_no_aux.pt \
+    --layer 3 \
+    --k $SAE_K \
+    --epochs $SAE_EPOCHS \
+    --samples $SAE_SAMPLES \
+    --output checkpoints/sae_on_control.pt
+
+# ============================================================
+# Step 5: Structure Check - Train SAE on SAE-ception model
+# ============================================================
+echo ""
+echo "Step 5: Training SAE on SAE-ception model..."
+uv run python scripts/train_sae_pretrained.py \
+    --model checkpoints/model_cpt_with_aux.pt \
+    --layer 3 \
+    --k $SAE_K \
+    --epochs $SAE_EPOCHS \
+    --samples $SAE_SAMPLES \
+    --output checkpoints/sae_on_saeception.pt
+
+# ============================================================
+# Summary
+# ============================================================
 echo ""
 echo "========================================"
-echo "Generating summary..."
+echo "SMOKE TEST COMPLETE"
 echo "========================================"
-
-uv run python -c "
-import json
-import glob
-
-results = []
-for f in sorted(glob.glob('$WORKDIR/results_k*.json')):
-    with open(f) as fp:
-        data = json.load(fp)
-    train_k = data.get('sae_k_train', f.split('_k')[-1].replace('.json',''))
-    baseline = data['baseline_perplexity']
-    
-    # Full reconstruction
-    full_ppl = data['full_recon_perplexity']
-    full_deg = (full_ppl - baseline) / baseline * 100
-    results.append((train_k, train_k, full_ppl, full_deg))
-    
-    # Each sharpening value
-    for k_str, info in data.get('k_sharp_results', {}).items():
-        results.append((train_k, k_str, info['perplexity'], info['relative_degradation_pct']))
-
-# Print table
-print()
-print('=' * 70)
-print('FULL RESULTS GRID')
-print('=' * 70)
-print(f'{\"Train k\":<10} {\"Sharp k\":<10} {\"PPL\":<12} {\"Degradation\":<12}')
-print('-' * 50)
-
-for train_k, sharp_k, ppl, deg in sorted(results, key=lambda x: (int(x[0]), int(x[1]))):
-    print(f'{train_k:<10} {sharp_k:<10} {ppl:<12.2f} {deg:<12.1f}%')
-
-# Save CSV
-with open('$SUMMARY_FILE', 'a') as f:
-    for train_k, sharp_k, ppl, deg in results:
-        f.write(f'{train_k},{sharp_k},{ppl:.2f},{deg:.1f}\n')
-
-print()
-print(f'Summary saved to: $SUMMARY_FILE')
-"
-
-# =============================================================================
-# Copy results back
-# =============================================================================
 echo ""
-echo "========================================"
-echo "COMPLETE"
-echo "========================================"
-
-cp "$WORKDIR"/results_k*.json "$SLURM_SUBMIT_DIR/" 2>/dev/null || true
-cp "$SUMMARY_FILE" "$SLURM_SUBMIT_DIR/" 2>/dev/null || true
-cp "$WORKDIR/checkpoints/"*.pt "$SLURM_SUBMIT_DIR/checkpoints/" 2>/dev/null || true
-
-echo "Results copied to: $SLURM_SUBMIT_DIR"
-echo "Summary CSV: $SLURM_SUBMIT_DIR/sweep_summary.csv"
+echo "Checkpoints created:"
+echo "  - checkpoints/sae_k${SAE_K}.pt (SAE on pretrained)"
+echo "  - checkpoints/model_cpt_no_aux.pt (CPT control)"
+echo "  - checkpoints/model_cpt_with_aux.pt (CPT + SAE-ception)"
+echo "  - checkpoints/sae_on_control.pt (SAE on control)"
+echo "  - checkpoints/sae_on_saeception.pt (SAE on SAE-ception)"
+echo ""
+echo "Check the .diagnostics.json files to compare:"
+echo "  - L0 sparsity"
+echo "  - Dead features %"
+echo "  - Reconstruction error"
