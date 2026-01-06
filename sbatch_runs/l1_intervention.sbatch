@@ -49,9 +49,44 @@ if torch.cuda.is_available():
 PY
 
 # ============================================================
-# Perplexity comparison
+# L1 Comparison
 # ============================================================
-uv run python scripts/compare_perplexity.py \
-  --checkpoint_dir checkpoints/ \
-  --baseline EleutherAI/pythia-70m \
-  --output results/comparison.json
+echo "========================================"
+echo "L1 PENALTY BASELINE (Run B)"
+echo "========================================"
+
+# Parameters
+MODEL="EleutherAI/pythia-70m"
+LAYER=3
+TRAIN_SAMPLES=10000
+EVAL_SAMPLES=500
+EPOCHS=1
+
+# L1 weights to sweep
+L1_WEIGHTS="0.0001 0.0005 0.001 0.005 0.01"
+
+mkdir -p checkpoints results
+
+for L1_WEIGHT in $L1_WEIGHTS; do
+    echo ""
+    echo "----------------------------------------"
+    echo "Training with L1 weight = $L1_WEIGHT"
+    echo "----------------------------------------"
+    
+    uv run python scripts/train_cpt_l1.py \
+        --model "$MODEL" \
+        --layer $LAYER \
+        --l1_weight $L1_WEIGHT \
+        --train_samples $TRAIN_SAMPLES \
+        --eval_samples $EVAL_SAMPLES \
+        --epochs $EPOCHS \
+        --output "checkpoints/model_l1_${L1_WEIGHT}.pt"
+done
+
+# Copy results back
+mkdir -p "$SLURM_SUBMIT_DIR/results" "$SLURM_SUBMIT_DIR/checkpoints"
+cp "$WORKDIR"/checkpoints/*.pt "$SLURM_SUBMIT_DIR/checkpoints/" 2>/dev/null || true
+cp "$WORKDIR"/checkpoints/*.json "$SLURM_SUBMIT_DIR/checkpoints/" 2>/dev/null || true
+
+echo ""
+echo "L1 baseline complete. Results in $SLURM_SUBMIT_DIR/checkpoints/"
