@@ -81,7 +81,7 @@
 
 ### Additional Metrics
 
-- [ ] **Feature Absorption Score (SAEBench)**
+- [x] **Feature Absorption Score (SAEBench)**
   - `saebench.py` exists but unclear if integrated with LLM pipeline
   - Measures if features stop firing when expected
 
@@ -135,33 +135,3 @@
   - Verify it does NOT improve structure
 
 ---
-
-## 📊 PROGRESS TRACKER
-
-| Category | Done | Total | Progress |
-|----------|------|-------|----------|
-| High Priority | 0 | 4 | ⬜⬜⬜⬜ |
-| Medium Priority | 0 | 4 | ⬜⬜⬜⬜ |
-| Lower Priority | 0 | 8 | ⬜⬜⬜⬜⬜⬜⬜⬜ |
-| Code Fixes | 0 | 5 | ⬜⬜⬜⬜⬜ |
-| **TOTAL** | **0** | **21** | **0%** |
-
----
-
-## 📝 NOTES
-
-### Decisions Made
-<!-- Record decisions here as you make them -->
-
-
-### Blockers
-<!-- Record any blockers here -->
-
-
-### Ideas for Later
-<!-- Park ideas that aren't urgent -->
-
-
----
-
-*Last updated: [DATE]*
