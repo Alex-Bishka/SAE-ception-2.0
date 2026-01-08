@@ -6,27 +6,39 @@ This script implements the "Structure Check" from the SAE-ception 2.0 research p
 - Compare L0 sparsity, dead features %, convergence speed
 - Compare decoder weight geometry (clustering, similarity)
 - Compare feature co-activation patterns
+- Compare feature absorption (SAEBench first-letter metric)
 - Hypothesis: SAE on SAE-ception model should be "lazier" (lower L0, faster convergence,
-  tighter clusters, more absorption)
+  tighter clusters, lower absorption)
 
 Uses existing evaluation infrastructure from sae_ception.evaluation:
 - clustering.py: ARI, Silhouette, Davies-Bouldin, etc.
 - interpretability.py: dead_features_pct, feature_usage_entropy
-- saebench.py: feature absorption (if activations provided)
+- saebench.py: feature absorption (first-letter absorption metric)
 
 Usage:
-    # Basic comparison (from diagnostics files)
+    # Basic comparison (from diagnostics files only)
     python scripts/compare_sae_structure.py \
         --control_sae checkpoints/sae_on_control.pt \
         --saeception_sae checkpoints/sae_on_saeception.pt \
         --output results/structure_check.json
         
-    # Full analysis with activations (enables clustering & absorption)
+    # Full analysis with models (enables co-activation & absorption)
     python scripts/compare_sae_structure.py \
         --control_sae checkpoints/sae_on_control.pt \
         --saeception_sae checkpoints/sae_on_saeception.pt \
         --control_model checkpoints/model_cpt_no_aux.pt \
         --saeception_model checkpoints/model_cpt_with_aux.pt \
+        --base_model EleutherAI/pythia-70m \
+        --output results/structure_check.json
+        
+    # Quick absorption test (fewer latent candidates)
+    python scripts/compare_sae_structure.py \
+        --control_sae checkpoints/sae_on_control.pt \
+        --saeception_sae checkpoints/sae_on_saeception.pt \
+        --control_model checkpoints/model_cpt_no_aux.pt \
+        --saeception_model checkpoints/model_cpt_with_aux.pt \
+        --base_model EleutherAI/pythia-70m \
+        --n_absorption_candidates 50 \
         --output results/structure_check.json
 """
 
@@ -41,6 +53,7 @@ from tabulate import tabulate
 import numpy as np
 from sklearn.cluster import KMeans
 from sklearn.metrics import silhouette_score
+from transformers import AutoModelForCausalLM, AutoTokenizer
 
 # Import existing evaluation infrastructure
 import sys
@@ -49,13 +62,134 @@ sys.path.insert(0, str(Path(__file__).parent.parent / 'src'))
 from sae_ception.models.sae import create_sae
 from sae_ception.evaluation.interpretability import evaluate_sae_quality, compute_sparsity_metrics
 from sae_ception.evaluation.clustering import compute_all_clustering_metrics
+from sae_ception.evaluation.saebench import compute_first_letter_absorption
+from sae_ception.utils.data import create_causal_lm_dataloader
+from sae_ception.utils.hooks import ActivationExtractor
 
 logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
 logger = logging.getLogger(__name__)
 
 
 # =============================================================================
-# DECODER WEIGHT GEOMETRY ANALYSIS (NEW)
+# TOKEN-LEVEL ACTIVATION EXTRACTION FOR ABSORPTION
+# =============================================================================
+
+def extract_token_activations_for_absorption(
+    model: torch.nn.Module,
+    tokenizer,
+    layer_idx: int,
+    device: str = 'cuda',
+    max_samples: int = 2000,
+    max_length: int = 512,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Extract token-level activations for absorption analysis.
+    
+    Args:
+        model: Language model
+        tokenizer: Tokenizer
+        layer_idx: Layer to extract from
+        device: Device to run on
+        max_samples: Max sequences to process
+        max_length: Max sequence length
+        
+    Returns:
+        Tuple of (activations [N_tokens, hidden], token_ids [N_tokens])
+    """
+    model.eval()
+    model.to(device)
+    
+    # Create dataloader
+    dataloader = create_causal_lm_dataloader(
+        tokenizer=tokenizer,
+        dataset_name='wikitext',
+        split='test',
+        batch_size=4,
+        max_length=max_length,
+        max_samples=max_samples,
+    )
+    
+    all_activations = []
+    all_token_ids = []
+    
+    # Get the base model for hook attachment
+    if hasattr(model, 'gpt_neox'):
+        base_model = model.gpt_neox
+    elif hasattr(model, 'transformer'):
+        base_model = model.transformer
+    else:
+        base_model = model
+    
+    logger.info(f"Extracting activations from layer {layer_idx}...")
+    
+    with torch.no_grad():
+        for batch in dataloader:
+            input_ids = batch['input_ids'].to(device)
+            attention_mask = batch.get('attention_mask')
+            if attention_mask is not None:
+                attention_mask = attention_mask.to(device)
+            else:
+                attention_mask = torch.ones_like(input_ids)
+            
+            batch_size, seq_len = input_ids.shape
+            
+            # Extract activations
+            with ActivationExtractor(base_model, str(layer_idx)) as extractor:
+                _ = model(input_ids=input_ids, attention_mask=attention_mask)
+                activations = extractor.get_activations()  # [batch, seq, hidden]
+            
+            # Flatten and filter padding
+            for b in range(batch_size):
+                for t in range(seq_len):
+                    if attention_mask[b, t] == 1:
+                        all_activations.append(activations[b, t].cpu())
+                        all_token_ids.append(input_ids[b, t].cpu())
+    
+    activations_tensor = torch.stack(all_activations)
+    token_ids_tensor = torch.stack(all_token_ids)
+    
+    logger.info(f"Extracted {len(activations_tensor)} token activations")
+    
+    return activations_tensor, token_ids_tensor
+
+
+def load_model_from_checkpoint(
+    checkpoint_path: str,
+    base_model_name: str,
+    device: str = 'cuda',
+) -> torch.nn.Module:
+    """
+    Load a model from a CPT checkpoint.
+    
+    Args:
+        checkpoint_path: Path to .pt checkpoint
+        base_model_name: HuggingFace model name for architecture
+        device: Device to load on
+        
+    Returns:
+        Loaded model
+    """
+    logger.info(f"Loading model from {checkpoint_path}")
+    
+    checkpoint = torch.load(checkpoint_path, map_location='cpu')
+    
+    # Get base model name from checkpoint if available
+    config = checkpoint.get('config', {})
+    model_name = config.get('model_name', base_model_name)
+    
+    # Load architecture
+    model = AutoModelForCausalLM.from_pretrained(model_name)
+    
+    # Load trained weights
+    model.load_state_dict(checkpoint['model_state_dict'])
+    model.to(device)
+    model.eval()
+    
+    return model
+
+
+# =============================================================================
+# DECODER WEIGHT GEOMETRY ANALYSIS
 # =============================================================================
 
 def compute_decoder_geometry(sae: torch.nn.Module, n_clusters: int = 10) -> Dict:
@@ -208,7 +342,7 @@ def compute_coactivation_patterns(
     
     # 5. Effective feature count (how many features carry 90% of activations)
     sorted_freq, _ = torch.sort(firing_freq, descending=True)
-    cumsum = torch.cumsum(sorted_freq, dim=0) / sorted_freq.sum()
+    cumsum = torch.cumsum(sorted_freq, dim=0) / (sorted_freq.sum() + 1e-8)
     effective_features = int((cumsum < 0.9).sum()) + 1
     
     return {
@@ -314,25 +448,51 @@ def compute_convergence_metrics(history: List[Dict]) -> Dict:
     }
 
 
+def load_sae_from_checkpoint(checkpoint_path: str, device: str = 'cuda') -> torch.nn.Module:
+    """Load SAE model from checkpoint."""
+    checkpoint = torch.load(checkpoint_path, map_location=device)
+    config = checkpoint.get('config', {})
+    
+    sae = create_sae(
+        input_dim=config.get('input_dim', 512),
+        hidden_dim=config.get('hidden_dim', 4096),
+        sae_type='topk',
+        k=config.get('k', 32),
+    )
+    sae.load_state_dict(checkpoint['model_state_dict'])
+    sae.to(device)
+    sae.eval()
+    
+    return sae
+
+
 def compare_saes(
-    control_path: str,
-    saeception_path: str,
+    control_sae_path: str,
+    saeception_sae_path: str,
+    control_model_path: Optional[str] = None,
+    saeception_model_path: Optional[str] = None,
+    base_model_name: str = 'EleutherAI/pythia-70m',
+    layer_idx: int = 3,
     control_history_path: Optional[str] = None,
     saeception_history_path: Optional[str] = None,
-    control_activations: Optional[torch.Tensor] = None,
-    saeception_activations: Optional[torch.Tensor] = None,
+    n_absorption_candidates: Optional[int] = None,
+    max_absorption_samples: int = 2000,
     device: str = 'cuda',
 ) -> Dict:
     """
     Compare two SAEs trained on control vs SAE-ception models.
     
     Args:
-        control_path: Path to control SAE checkpoint
-        saeception_path: Path to SAE-ception SAE checkpoint
+        control_sae_path: Path to control SAE checkpoint
+        saeception_sae_path: Path to SAE-ception SAE checkpoint
+        control_model_path: Path to control model checkpoint (for full analysis)
+        saeception_model_path: Path to SAE-ception model checkpoint (for full analysis)
+        base_model_name: Base model name for loading architecture
+        layer_idx: Layer to extract activations from
         control_history_path: Optional training history JSON
         saeception_history_path: Optional training history JSON
-        control_activations: Optional activations for full analysis
-        saeception_activations: Optional activations for full analysis
+        n_absorption_candidates: Number of latent candidates for absorption (None = all)
+        max_absorption_samples: Max sequences for absorption analysis
         device: Device for computation
         
     Returns:
@@ -346,17 +506,17 @@ def compare_saes(
     
     # Load diagnostics (basic metrics from training)
     logger.info("Loading control SAE diagnostics...")
-    control_diag = load_diagnostics(control_path)
-    control_info = load_checkpoint_info(control_path)
+    control_diag = load_diagnostics(control_sae_path)
+    control_info = load_checkpoint_info(control_sae_path)
     
     logger.info("Loading SAE-ception SAE diagnostics...")
-    saeception_diag = load_diagnostics(saeception_path)
-    saeception_info = load_checkpoint_info(saeception_path)
+    saeception_diag = load_diagnostics(saeception_sae_path)
+    saeception_info = load_checkpoint_info(saeception_sae_path)
     
-    # Load SAE models for geometry analysis
+    # Load SAE models
     logger.info("Loading SAE models...")
-    control_sae = load_sae_from_checkpoint(control_path, device)
-    saeception_sae = load_sae_from_checkpoint(saeception_path, device)
+    control_sae = load_sae_from_checkpoint(control_sae_path, device)
+    saeception_sae = load_sae_from_checkpoint(saeception_sae_path, device)
     
     # Core metrics from diagnostics
     for name, diag, info in [('control', control_diag, control_info), 
@@ -367,36 +527,104 @@ def compare_saes(
         results[name]['cosine_similarity'] = diag.get('cosine_similarity')
         results[name]['mse'] = diag.get('mse')
     
-    # Decoder geometry analysis (NEW)
+    # Decoder geometry analysis
     logger.info("Analyzing decoder weight geometry...")
     results['control']['geometry'] = compute_decoder_geometry(control_sae)
     results['saeception']['geometry'] = compute_decoder_geometry(saeception_sae)
     
-    # Co-activation analysis (if activations provided)
-    if control_activations is not None:
-        logger.info("Analyzing control SAE co-activation patterns...")
-        results['control']['coactivation'] = compute_coactivation_patterns(
-            control_sae, control_activations, device
-        )
+    # ==========================================================================
+    # FULL ANALYSIS (requires model checkpoints)
+    # ==========================================================================
     
-    if saeception_activations is not None:
+    if control_model_path and saeception_model_path:
+        logger.info("=" * 60)
+        logger.info("Running full analysis with model activations...")
+        logger.info("=" * 60)
+        
+        # Load tokenizer
+        tokenizer = AutoTokenizer.from_pretrained(base_model_name)
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token
+        
+        # Load models and extract activations
+        logger.info("\nExtracting control model activations...")
+        control_model = load_model_from_checkpoint(control_model_path, base_model_name, device)
+        control_acts, control_token_ids = extract_token_activations_for_absorption(
+            control_model, tokenizer, layer_idx, device, max_absorption_samples
+        )
+        del control_model  # Free memory
+        torch.cuda.empty_cache()
+        
+        logger.info("\nExtracting SAE-ception model activations...")
+        saeception_model = load_model_from_checkpoint(saeception_model_path, base_model_name, device)
+        saeception_acts, saeception_token_ids = extract_token_activations_for_absorption(
+            saeception_model, tokenizer, layer_idx, device, max_absorption_samples
+        )
+        del saeception_model  # Free memory
+        torch.cuda.empty_cache()
+        
+        # Co-activation analysis
+        logger.info("\nAnalyzing control SAE co-activation patterns...")
+        results['control']['coactivation'] = compute_coactivation_patterns(
+            control_sae, control_acts, device
+        )
+        
         logger.info("Analyzing SAE-ception SAE co-activation patterns...")
         results['saeception']['coactivation'] = compute_coactivation_patterns(
-            saeception_sae, saeception_activations, device
+            saeception_sae, saeception_acts, device
         )
-    
-    # Full SAE quality metrics (if activations provided)
-    if control_activations is not None:
-        logger.info("Computing full SAE quality metrics (control)...")
+        
+        # SAE quality metrics
+        logger.info("\nComputing full SAE quality metrics (control)...")
         results['control']['quality'] = evaluate_sae_quality(
-            control_sae, control_activations, device
+            control_sae, control_acts, device
         )
-    
-    if saeception_activations is not None:
+        
         logger.info("Computing full SAE quality metrics (SAE-ception)...")
         results['saeception']['quality'] = evaluate_sae_quality(
-            saeception_sae, saeception_activations, device
+            saeception_sae, saeception_acts, device
         )
+        
+        # ======================================================================
+        # FEATURE ABSORPTION ANALYSIS (SAEBench first-letter)
+        # ======================================================================
+        logger.info("\n" + "=" * 60)
+        logger.info("FEATURE ABSORPTION ANALYSIS")
+        logger.info("=" * 60)
+        
+        logger.info("\nComputing absorption for control SAE...")
+        try:
+            control_absorption = compute_first_letter_absorption(
+                sae=control_sae,
+                activations=control_acts,
+                token_ids=control_token_ids,
+                tokenizer=tokenizer,
+                device=device,
+                n_latent_candidates=n_absorption_candidates,
+                show_progress=True,
+            )
+            results['control']['absorption'] = control_absorption
+            logger.info(f"Control absorption: {control_absorption.get('absorption', 'N/A'):.4f}")
+        except Exception as e:
+            logger.error(f"Control absorption failed: {e}")
+            results['control']['absorption'] = {'error': str(e)}
+        
+        logger.info("\nComputing absorption for SAE-ception SAE...")
+        try:
+            saeception_absorption = compute_first_letter_absorption(
+                sae=saeception_sae,
+                activations=saeception_acts,
+                token_ids=saeception_token_ids,
+                tokenizer=tokenizer,
+                device=device,
+                n_latent_candidates=n_absorption_candidates,
+                show_progress=True,
+            )
+            results['saeception']['absorption'] = saeception_absorption
+            logger.info(f"SAE-ception absorption: {saeception_absorption.get('absorption', 'N/A'):.4f}")
+        except Exception as e:
+            logger.error(f"SAE-ception absorption failed: {e}")
+            results['saeception']['absorption'] = {'error': str(e)}
     
     # Convergence analysis from training histories
     control_history = load_training_history(control_history_path)
@@ -444,6 +672,16 @@ def compare_saes(
             'firing_gini_diff': sae_coact.get('firing_gini', 0) - ctrl_coact.get('firing_gini', 0),
         }
     
+    # Absorption comparison
+    ctrl_abs = results['control'].get('absorption', {})
+    sae_abs = results['saeception'].get('absorption', {})
+    
+    if ctrl_abs and sae_abs and 'absorption' in ctrl_abs and 'absorption' in sae_abs:
+        results['comparison']['absorption'] = {
+            'absorption_diff': sae_abs['absorption'] - ctrl_abs['absorption'],
+            'absorption_reduction_pct': (ctrl_abs['absorption'] - sae_abs['absorption']) / (ctrl_abs['absorption'] + 1e-8) * 100,
+        }
+    
     # Convergence comparison
     if 'convergence' in results['control'] and 'convergence' in results['saeception']:
         ctrl_conv = results['control']['convergence']
@@ -457,24 +695,6 @@ def compare_saes(
         )
     
     return results
-
-
-def load_sae_from_checkpoint(checkpoint_path: str, device: str = 'cuda') -> torch.nn.Module:
-    """Load SAE model from checkpoint."""
-    checkpoint = torch.load(checkpoint_path, map_location=device)
-    config = checkpoint.get('config', {})
-    
-    sae = create_sae(
-        input_dim=config.get('input_dim', 512),
-        hidden_dim=config.get('hidden_dim', 4096),
-        sae_type='topk',
-        k=config.get('k', 32),
-    )
-    sae.load_state_dict(checkpoint['model_state_dict'])
-    sae.to(device)
-    sae.eval()
-    
-    return sae
 
 
 def print_comparison_table(results: Dict):
@@ -579,6 +799,50 @@ def print_comparison_table(results: Dict):
         print(tabulate(coact_data, headers=headers, tablefmt="simple"))
     
     # ==========================================================================
+    # FEATURE ABSORPTION (NEW!)
+    # ==========================================================================
+    ctrl_abs = results['control'].get('absorption', {})
+    sae_abs = results['saeception'].get('absorption', {})
+    
+    if ctrl_abs and sae_abs and 'error' not in ctrl_abs and 'error' not in sae_abs:
+        print("\n🎯 FEATURE ABSORPTION (SAEBench First-Letter)")
+        print("-" * 80)
+        
+        abs_data = []
+        abs_metrics = [
+            ('Absorption Score', 'absorption', '.4f', 'lower'),  # Lower = features stay clean
+            ('Absorption Complement', 'absorption_complement', '.4f', 'higher'),  # Higher = better
+            ('Letters Evaluated', 'n_letters_evaluated', 'd', 'context'),
+            ('Test Samples', 'n_test_samples', 'd', 'context'),
+        ]
+        
+        for name, key, fmt, better in abs_metrics:
+            ctrl_val = ctrl_abs.get(key)
+            sae_val = sae_abs.get(key)
+            
+            if ctrl_val is not None and sae_val is not None:
+                diff = sae_val - ctrl_val
+                if better == 'context':
+                    indicator = "~"
+                else:
+                    is_better = diff < 0 if better == 'lower' else diff > 0
+                    indicator = "✓" if is_better else "✗"
+                abs_data.append([name, f"{ctrl_val:{fmt}}", f"{sae_val:{fmt}}", f"{diff:+{fmt}}", indicator])
+        
+        print(tabulate(abs_data, headers=headers, tablefmt="simple"))
+        
+        # Show absorption reduction percentage
+        if 'absorption' in results.get('comparison', {}).get('absorption', {}):
+            reduction = results['comparison']['absorption']['absorption_reduction_pct']
+            print(f"\n  Absorption reduction: {reduction:+.1f}%")
+    
+    elif ctrl_abs.get('error') or sae_abs.get('error'):
+        print("\n🎯 FEATURE ABSORPTION")
+        print("-" * 80)
+        print(f"  Control error: {ctrl_abs.get('error', 'None')}")
+        print(f"  SAE-ception error: {sae_abs.get('error', 'None')}")
+    
+    # ==========================================================================
     # CONVERGENCE ANALYSIS
     # ==========================================================================
     if 'convergence' in results['control'] and 'convergence' in results['saeception']:
@@ -638,7 +902,12 @@ def print_comparison_table(results: Dict):
         eff_diff = sae_coact.get('effective_features', 0) - ctrl_coact.get('effective_features', 0)
         hypothesis_checks.append(('Fewer effective features', eff_diff < 0, f"{eff_diff:+d}"))
     
-    # Check 5: Faster convergence
+    # Check 5: Lower absorption (NEW!)
+    if ctrl_abs and sae_abs and 'absorption' in ctrl_abs and 'absorption' in sae_abs:
+        abs_diff = sae_abs['absorption'] - ctrl_abs['absorption']
+        hypothesis_checks.append(('Lower feature absorption', abs_diff < 0, f"{abs_diff:+.4f}"))
+    
+    # Check 6: Faster convergence
     if 'convergence_speedup' in results['comparison']:
         speedup = results['comparison']['convergence_speedup']
         hypothesis_checks.append(('Faster convergence', speedup > 0, f"{speedup:+d} epochs"))
@@ -673,18 +942,6 @@ def main():
     )
     
     parser.add_argument(
-        '--control_model',
-        type=str,
-        default=None,
-        help='Path to control model checkpoint (for generating activations)'
-    )
-    parser.add_argument(
-        '--saeception_model',
-        type=str,
-        default=None,
-        help='Path to SAE-ception model checkpoint (for generating activations)'
-    )
-    parser.add_argument(
         '--control_sae',
         type=str,
         required=True,
@@ -695,6 +952,30 @@ def main():
         type=str,
         required=True,
         help='Path to SAE trained on SAE-ception model'
+    )
+    parser.add_argument(
+        '--control_model',
+        type=str,
+        default=None,
+        help='Path to control model checkpoint (enables full analysis including absorption)'
+    )
+    parser.add_argument(
+        '--saeception_model',
+        type=str,
+        default=None,
+        help='Path to SAE-ception model checkpoint (enables full analysis including absorption)'
+    )
+    parser.add_argument(
+        '--base_model',
+        type=str,
+        default='EleutherAI/pythia-70m',
+        help='Base model name for architecture (default: EleutherAI/pythia-70m)'
+    )
+    parser.add_argument(
+        '--layer',
+        type=int,
+        default=3,
+        help='Layer to extract activations from (default: 3)'
     )
     parser.add_argument(
         '--control_history',
@@ -709,20 +990,45 @@ def main():
         help='Path to SAE-ception SAE training history JSON'
     )
     parser.add_argument(
+        '--n_absorption_candidates',
+        type=int,
+        default=None,
+        help='Number of latent candidates for absorption (None = all, 50-100 for quick test)'
+    )
+    parser.add_argument(
+        '--max_absorption_samples',
+        type=int,
+        default=2000,
+        help='Max sequences for absorption analysis (default: 2000)'
+    )
+    parser.add_argument(
         '--output',
         type=str,
         default=None,
         help='Output path for results JSON'
+    )
+    parser.add_argument(
+        '--device',
+        type=str,
+        default='cuda',
+        help='Device to use (default: cuda)'
     )
     
     args = parser.parse_args()
     
     # Run comparison
     results = compare_saes(
-        control_path=args.control_sae,
-        saeception_path=args.saeception_sae,
+        control_sae_path=args.control_sae,
+        saeception_sae_path=args.saeception_sae,
+        control_model_path=args.control_model,
+        saeception_model_path=args.saeception_model,
+        base_model_name=args.base_model,
+        layer_idx=args.layer,
         control_history_path=args.control_history,
         saeception_history_path=args.saeception_history,
+        n_absorption_candidates=args.n_absorption_candidates,
+        max_absorption_samples=args.max_absorption_samples,
+        device=args.device,
     )
     
     # Print table

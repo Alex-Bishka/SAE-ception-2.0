@@ -20,7 +20,7 @@
   - Output: Single table with PPL and % degradation
   - Tax Check: Verify degradation <2%
 
-- [ ] **Structure Check Analysis Script**
+- [x] **Structure Check Analysis Script**
   - Compare SAEs trained on control vs SAE-ception models
   - Metrics to compare: L0 sparsity, dead features %, convergence speed
   - Hypothesis: SAE on SAE-ception model should be "lazier"
