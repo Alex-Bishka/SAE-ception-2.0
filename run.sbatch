@@ -56,4 +56,5 @@ uv run python scripts/compare_sae_structure.py \
   --saeception_sae checkpoints/sae_on_saeception.pt \
   --control_model checkpoints/model_cpt_no_aux.pt \
   --saeception_model checkpoints/model_cpt_with_aux.pt \
+  --n_absorption_candidates 50 \
   --output results/structure_check.json

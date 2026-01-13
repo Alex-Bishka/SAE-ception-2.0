@@ -70,6 +70,26 @@ logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
 logger = logging.getLogger(__name__)
 
 
+def convert_to_serializable(obj):
+    """Recursively convert numpy/torch types to native Python types for JSON serialization."""
+    if isinstance(obj, dict):
+        return {k: convert_to_serializable(v) for k, v in obj.items()}
+    elif isinstance(obj, list):
+        return [convert_to_serializable(v) for v in obj]
+    elif isinstance(obj, (np.floating, np.float32, np.float64)):
+        return float(obj)
+    elif isinstance(obj, (np.integer, np.int32, np.int64)):
+        return int(obj)
+    elif isinstance(obj, np.ndarray):
+        return obj.tolist()
+    elif isinstance(obj, (torch.Tensor,)):
+        return obj.cpu().tolist()
+    elif isinstance(obj, np.bool_):
+        return bool(obj)
+    else:
+        return obj
+
+
 # =============================================================================
 # TOKEN-LEVEL ACTIVATION EXTRACTION FOR ABSORPTION
 # =============================================================================
@@ -1039,7 +1059,7 @@ def main():
         output_path = Path(args.output)
         output_path.parent.mkdir(parents=True, exist_ok=True)
         with open(output_path, 'w') as f:
-            json.dump(results, f, indent=2)
+            json.dump(convert_to_serializable(results), f, indent=2)
         logger.info(f"Results saved to {output_path}")
     
     return results
