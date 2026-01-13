@@ -1,5 +1,5 @@
 name: pile
-hf_path: EleutherAI/pile
+hf_path: monology/pile-uncopyrighted  # Original EleutherAI/pile removed due to copyright
 hf_name: null
 
 # For causal LM (CPT)

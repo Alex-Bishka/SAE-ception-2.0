@@ -49,12 +49,13 @@ if torch.cuda.is_available():
 PY
 
 # ============================================================
-# SAE Structure Check
+# Step 2: Train SAE on Pretrained Pythia-410M
 # ============================================================
-uv run python scripts/compare_sae_structure.py \
-  --control_sae checkpoints/sae_on_control.pt \
-  --saeception_sae checkpoints/sae_on_saeception.pt \
-  --control_model checkpoints/model_cpt_no_aux.pt \
-  --saeception_model checkpoints/model_cpt_with_aux.pt \
-  --n_absorption_candidates 50 \
-  --output results/structure_check.json
+uv run python scripts/train_sae_pretrained.py \
+  --model EleutherAI/pythia-410m \
+  --layer 12 \
+  --samples 10000000 \
+  --epochs 1 \
+  --k 32 \
+  --dataset pile \
+  --output checkpoints/sae_pythia410m_k32.pt

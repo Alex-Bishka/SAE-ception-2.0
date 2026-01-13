@@ -215,24 +215,24 @@ def train_sae(
     lr: float = 3e-4,
     device: str = 'cuda',
     output_path: Optional[str] = None,
+    dataset_name: str = 'wikitext',
 ) -> torch.nn.Module:
     """Train an SAE with proper hyperparameters."""
-    
+
     sae_hidden = hidden_size * expansion_factor
-    
+
     # Extract activations
     logger.info(f"Extracting activations from layer {layer_idx}...")
-    logger.info(f"Target: {n_samples} samples")
-    
+    logger.info(f"Target: {n_samples} samples from {dataset_name}")
+
     # Estimate how many sequences we need
-    # WikiText has ~500 tokens per non-empty line on average
     seq_len = 512
     avg_tokens_per_sample = seq_len * 0.7  # Account for padding
     n_sequences = int(n_samples / avg_tokens_per_sample) + 100  # Extra buffer
-    
+
     train_loader = create_causal_lm_dataloader(
         tokenizer=tokenizer,
-        dataset_name='wikitext',
+        dataset_name=dataset_name,
         split='train',
         batch_size=8,
         max_length=seq_len,
@@ -388,6 +388,7 @@ def main():
     parser.add_argument('--checkpoint', type=str, default=None, help='Load existing checkpoint')
     parser.add_argument('--diagnose-only', action='store_true', help='Only run diagnostics')
     parser.add_argument('--quick', action='store_true', help='Quick test (10k samples, 10 epochs)')
+    parser.add_argument('--dataset', type=str, default='wikitext', help='Dataset name (wikitext, pile, etc.)')
     parser.add_argument('--device', type=str, default='cuda')
     
     args = parser.parse_args()
@@ -493,6 +494,7 @@ def main():
             lr=args.lr,
             device=args.device,
             output_path=args.output,
+            dataset_name=args.dataset,
         )
     
     # Run diagnostics

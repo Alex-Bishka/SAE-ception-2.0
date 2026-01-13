@@ -1,0 +1,15 @@
+name: pythia_410m
+hf_path: EleutherAI/pythia-410m
+hidden_size: 1024
+num_layers: 24
+target_layer: 12  # Middle layer for intervention
+
+# Training parameters (for future CPT)
+learning_rate: 1e-4
+weight_decay: 0.1
+warmup_steps: 500
+max_grad_norm: 1.0
+
+# Fine-tuning
+epochs_per_cycle: 1
+gradient_accumulation_steps: 4

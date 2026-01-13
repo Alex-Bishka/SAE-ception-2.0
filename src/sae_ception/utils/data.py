@@ -525,16 +525,16 @@ def create_causal_lm_dataloader(
 ) -> DataLoader:
     """
     Create a dataloader for causal LM evaluation.
-    
+
     Args:
         tokenizer: Tokenizer
-        dataset_name: 'wikitext' (more datasets can be added)
+        dataset_name: 'wikitext' or 'pile'
         split: Dataset split
         batch_size: Batch size
         max_length: Max sequence length
         max_samples: Limit samples
         num_workers: DataLoader workers
-        
+
     Returns:
         DataLoader
     """
@@ -542,16 +542,24 @@ def create_causal_lm_dataloader(
         dataset = load_wikitext_for_eval(
             tokenizer, split, max_length, max_samples
         )
+        return DataLoader(
+            dataset,
+            batch_size=batch_size,
+            shuffle=False,
+            num_workers=num_workers,
+            pin_memory=True,
+        )
+    elif dataset_name == 'pile':
+        # Use the batched pile loader which pre-downloads samples
+        return create_pile_dataloader_batched(
+            tokenizer=tokenizer,
+            batch_size=batch_size,
+            max_length=max_length,
+            max_samples=max_samples or 100000,
+            num_workers=num_workers,
+        )
     else:
-        raise ValueError(f"Unknown dataset: {dataset_name}")
-    
-    return DataLoader(
-        dataset,
-        batch_size=batch_size,
-        shuffle=False,
-        num_workers=num_workers,
-        pin_memory=True,
-    )
+        raise ValueError(f"Unknown dataset: {dataset_name}. Supported: wikitext, pile")
 
 # =============================================================================
 # ADD THESE FUNCTIONS TO src/sae_ception/utils/data.py
