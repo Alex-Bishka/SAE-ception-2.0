@@ -38,6 +38,12 @@ from tqdm import tqdm
 import json
 import math
 
+try:
+    import wandb
+    WANDB_AVAILABLE = True
+except ImportError:
+    WANDB_AVAILABLE = False
+
 from sae_ception.models.sae import create_sae
 from sae_ception.utils.hooks import ActivationExtractor, create_sae_intervention
 from sae_ception.utils.data import create_causal_lm_dataloader
@@ -264,6 +270,7 @@ def train_cpt(
     device: str = 'cuda',
     output_path: Optional[str] = None,
     quick: bool = False,
+    wandb_run=None,
 ):
     """
     Run CPT with SAE-ception auxiliary loss.
@@ -432,6 +439,18 @@ def train_cpt(
             'train': train_metrics,
             'eval_perplexity': eval_results['perplexity'],
         })
+
+        # W&B logging
+        if wandb_run is not None:
+            wandb_run.log({
+                'epoch': epoch + 1,
+                'train/loss': train_metrics['loss'],
+                'train/lm_loss': train_metrics['lm_loss'],
+                'train/aux_loss': train_metrics['aux_loss'],
+                'train/perplexity': train_metrics['perplexity'],
+                'eval/perplexity': eval_results['perplexity'],
+                'eval/ppl_change': eval_results['perplexity'] - baseline_results['perplexity'],
+            })
     
     # Load best model
     if best_state is not None:
@@ -478,7 +497,18 @@ def train_cpt(
         with open(results_path, 'w') as f:
             json.dump(results, f, indent=2)
         logger.info(f"Saved results to {results_path}")
-    
+
+    # Log final results to W&B
+    if wandb_run is not None:
+        wandb_run.log({
+            'final/baseline_perplexity': baseline_results['perplexity'],
+            'final/perplexity': final_results['perplexity'],
+            'final/ppl_change': results['perplexity_change'],
+            'final/ppl_change_pct': results['perplexity_change_pct'],
+        })
+        wandb_run.finish()
+        logger.info("W&B run finished")
+
     return model, results
 
 
@@ -505,9 +535,37 @@ def main():
     parser.add_argument('--output', type=str, default=None)
     parser.add_argument('--quick', action='store_true', help='Quick test mode')
     parser.add_argument('--device', type=str, default='cuda')
-    
+    parser.add_argument('--wandb', action='store_true', help='Enable Weights & Biases logging')
+    parser.add_argument('--wandb-project', type=str, default='sae-ception', help='W&B project name')
+    parser.add_argument('--wandb-run-name', type=str, default=None, help='W&B run name')
+
     args = parser.parse_args()
-    
+
+    # Initialize W&B if enabled
+    wandb_run = None
+    if args.wandb:
+        if not WANDB_AVAILABLE:
+            logger.warning("W&B requested but not installed. Skipping.")
+        else:
+            run_name = args.wandb_run_name or f"cpt_{args.model.split('/')[-1]}_k{args.k_sharp}_aux{args.aux_weight}"
+            wandb_run = wandb.init(
+                project=args.wandb_project,
+                name=run_name,
+                config={
+                    'model': args.model,
+                    'sae_checkpoint': args.sae_checkpoint,
+                    'sae_k': args.sae_k,
+                    'k_sharp': args.k_sharp,
+                    'layer': args.layer,
+                    'aux_weight': args.aux_weight,
+                    'train_samples': args.train_samples,
+                    'epochs': args.epochs,
+                    'batch_size': args.batch_size,
+                    'lr': args.lr,
+                },
+            )
+            logger.info(f"W&B initialized: {wandb_run.url}")
+
     train_cpt(
         model_name=args.model,
         sae_checkpoint=args.sae_checkpoint,
@@ -524,6 +582,7 @@ def main():
         device=args.device,
         output_path=args.output,
         quick=args.quick,
+        wandb_run=wandb_run,
     )
 
 

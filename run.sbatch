@@ -58,4 +58,5 @@ uv run python scripts/train_sae_pretrained.py \
   --epochs 1 \
   --k 32 \
   --dataset pile \
+  --wandb \
   --output checkpoints/sae_pythia410m_k32.pt

@@ -29,6 +29,12 @@ from tqdm import tqdm
 import json
 import math
 
+try:
+    import wandb
+    WANDB_AVAILABLE = True
+except ImportError:
+    WANDB_AVAILABLE = False
+
 from sae_ception.models.sae import create_sae
 from sae_ception.utils.hooks import ActivationExtractor
 from sae_ception.utils.data import (
@@ -216,6 +222,7 @@ def train_sae(
     device: str = 'cuda',
     output_path: Optional[str] = None,
     dataset_name: str = 'wikitext',
+    wandb_run=None,
 ) -> torch.nn.Module:
     """Train an SAE with proper hyperparameters."""
 
@@ -339,6 +346,16 @@ def train_sae(
                 f"loss={avg_loss:.4f} (recon={avg_recon:.4f}, aux={avg_aux:.4f}), "
                 f"lr={scheduler.get_last_lr()[0]:.2e}"
             )
+
+        # W&B logging
+        if wandb_run is not None:
+            wandb_run.log({
+                'epoch': epoch + 1,
+                'train/loss': avg_loss,
+                'train/recon_loss': avg_recon,
+                'train/aux_loss': avg_aux,
+                'train/lr': scheduler.get_last_lr()[0],
+            })
     
     # Load best state
     if best_state is not None:
@@ -390,6 +407,9 @@ def main():
     parser.add_argument('--quick', action='store_true', help='Quick test (10k samples, 10 epochs)')
     parser.add_argument('--dataset', type=str, default='wikitext', help='Dataset name (wikitext, pile, etc.)')
     parser.add_argument('--device', type=str, default='cuda')
+    parser.add_argument('--wandb', action='store_true', help='Enable Weights & Biases logging')
+    parser.add_argument('--wandb-project', type=str, default='sae-ception', help='W&B project name')
+    parser.add_argument('--wandb-run-name', type=str, default=None, help='W&B run name (auto-generated if not set)')
     
     args = parser.parse_args()
     
@@ -398,7 +418,31 @@ def main():
         args.samples = 10000
         args.epochs = 10
         logger.info("Quick mode: 10k samples, 10 epochs")
-    
+
+    # Initialize W&B if enabled
+    wandb_run = None
+    if args.wandb:
+        if not WANDB_AVAILABLE:
+            logger.warning("W&B requested but not installed. Skipping.")
+        else:
+            run_name = args.wandb_run_name or f"sae_{args.model.split('/')[-1]}_k{args.k}_layer{args.layer}"
+            wandb_run = wandb.init(
+                project=args.wandb_project,
+                name=run_name,
+                config={
+                    'model': args.model,
+                    'layer': args.layer,
+                    'expansion_factor': args.expansion,
+                    'k': args.k,
+                    'samples': args.samples,
+                    'epochs': args.epochs,
+                    'batch_size': args.batch_size,
+                    'lr': args.lr,
+                    'dataset': args.dataset,
+                },
+            )
+            logger.info(f"W&B initialized: {wandb_run.url}")
+
     # Determine base model name for tokenizer
     if args.model.endswith('.pt'):
         # Load checkpoint to get base model name
@@ -495,6 +539,7 @@ def main():
             device=args.device,
             output_path=args.output,
             dataset_name=args.dataset,
+            wandb_run=wandb_run,
         )
     
     # Run diagnostics
@@ -508,7 +553,19 @@ def main():
         with open(diag_path, 'w') as f:
             json.dump(metrics, f, indent=2)
         logger.info(f"Diagnostics saved to {diag_path}")
-    
+
+    # Log final diagnostics to W&B
+    if wandb_run is not None:
+        wandb_run.log({
+            'diagnostics/l0_sparsity': metrics.get('l0_sparsity', 0),
+            'diagnostics/dead_features_pct': metrics.get('dead_features_pct', 0),
+            'diagnostics/mean_cosine_sim': metrics.get('mean_cosine_sim', 0),
+            'diagnostics/reconstruction_mse': metrics.get('reconstruction_mse', 0),
+            'diagnostics/relative_reconstruction_error': metrics.get('relative_reconstruction_error', 0),
+        })
+        wandb_run.finish()
+        logger.info("W&B run finished")
+
     return is_good
 
 
