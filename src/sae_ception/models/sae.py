@@ -135,7 +135,10 @@ class TopKSparseAutoencoder(nn.Module):
         pre_acts_relu = F.relu(pre_acts)
         topk_values, topk_indices = torch.topk(pre_acts_relu, k=self.k, dim=-1)
 
-        sparse_code = torch.zeros_like(pre_acts).scatter(dim=-1, index=topk_indices, src=topk_values)
+        # Use mask multiplication for robust gradient flow
+        mask = torch.zeros_like(pre_acts_relu)
+        mask.scatter_(-1, topk_indices, 1.0)
+        sparse_code = pre_acts_relu * mask
         return sparse_code
 
     def decode(self, sparse_code: torch.Tensor) -> torch.Tensor:
@@ -146,14 +149,18 @@ class TopKSparseAutoencoder(nn.Module):
         """Training forward pass - tracks info needed for aux loss."""
         # 1. Compute pre-activations
         pre_acts = self.encode_pre_act(x)
-        
+
         # 2. Top-K Selection
         pre_acts_relu = F.relu(pre_acts)
         topk_values, topk_indices = torch.topk(pre_acts_relu, k=self.k, dim=-1)
-        
-        # 3. Create Sparse Code (use scatter, not scatter_ to preserve gradients)
-        sparse_code = torch.zeros_like(pre_acts).scatter(dim=-1, index=topk_indices, src=topk_values)
-        
+
+        # 3. Create Sparse Code using mask multiplication (robust gradient flow)
+        # Create binary mask: 1 at top-k positions, 0 elsewhere
+        mask = torch.zeros_like(pre_acts_relu)
+        mask.scatter_(-1, topk_indices, 1.0)
+        # Multiply: gradient flows through pre_acts_relu, mask just selects positions
+        sparse_code = pre_acts_relu * mask
+
         # 4. Decode
         reconstruction = self.decode(sparse_code)
         
@@ -217,11 +224,12 @@ class TopKSparseAutoencoder(nn.Module):
                 
                 if k_aux > 0:
                     aux_vals, aux_inds = torch.topk(dead_pre_acts, k=k_aux, dim=-1)
-                    aux_vals = F.relu(aux_vals)
-                    
-                    # Create sparse code for aux features (non-in-place to preserve gradients)
-                    aux_sparse = torch.zeros_like(pre_acts).scatter(-1, aux_inds, aux_vals)
-                    
+
+                    # Create sparse code using mask multiplication (robust gradient flow)
+                    aux_mask = torch.zeros_like(pre_acts)
+                    aux_mask.scatter_(-1, aux_inds, 1.0)
+                    aux_sparse = F.relu(pre_acts) * aux_mask
+
                     # Decode aux features
                     aux_recon = self.decode(aux_sparse)
                     

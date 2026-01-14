@@ -17,10 +17,11 @@ Usage:
 """
 
 import argparse
+import math
 import torch
 import torch.nn.functional as F
 from torch.optim import Adam
-from torch.optim.lr_scheduler import CosineAnnealingLR
+from torch.optim.lr_scheduler import LambdaLR
 from pathlib import Path
 from transformers import AutoModelForCausalLM, AutoTokenizer
 import logging
@@ -245,9 +246,21 @@ def train_sae(
     )
     sae.to(device)
 
-    # Optimizer and scheduler
+    # Calculate total steps first (needed for scheduler)
+    total_steps = (n_samples * n_epochs) // batch_size
+    warmup_steps = min(1000, total_steps // 10)  # 1000 steps or 10% of training
+
+    # Optimizer with warmup + cosine decay (SAELens best practice)
     optimizer = Adam(sae.parameters(), lr=lr, betas=(0.9, 0.999))
-    scheduler = CosineAnnealingLR(optimizer, T_max=n_epochs, eta_min=lr * 0.1)
+
+    def lr_lambda(step):
+        """Warmup + cosine decay schedule."""
+        if step < warmup_steps:
+            return step / warmup_steps
+        progress = (step - warmup_steps) / (total_steps - warmup_steps)
+        return 0.5 * (1 + math.cos(math.pi * progress))
+
+    scheduler = LambdaLR(optimizer, lr_lambda)
 
     # Setup checkpoint directory
     checkpoint_dir = None
@@ -256,9 +269,6 @@ def train_sae(
         if checkpoint_dir.suffix:  # If it's a file path, use parent dir
             checkpoint_dir = checkpoint_dir.parent / checkpoint_dir.stem
         checkpoint_dir.mkdir(parents=True, exist_ok=True)
-
-    # Calculate total steps for checkpoint scheduling
-    total_steps = (n_samples * n_epochs) // batch_size
     checkpoint_every = max(1, total_steps * checkpoint_interval // 100)
     resampling_stop_step = int(total_steps * resampling_stop)
 
@@ -268,7 +278,7 @@ def train_sae(
     logger.info(f"  Hidden dim: {sae_hidden} ({expansion_factor}x)")
     logger.info(f"  k (TopK): {k}")
     logger.info(f"  Batch size: {batch_size}")
-    logger.info(f"  Learning rate: {lr}")
+    logger.info(f"  Learning rate: {lr} (warmup={warmup_steps} steps, cosine decay)")
     logger.info(f"  Dataset: {dataset_name}")
     logger.info(f"  Total steps: ~{total_steps:,}")
     logger.info(f"  Checkpoint every: {checkpoint_every} steps ({checkpoint_interval}%)")
@@ -366,15 +376,16 @@ def train_sae(
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(sae.parameters(), 1.0)
                 optimizer.step()
+                scheduler.step()
 
                 # Normalize decoder columns
                 if hasattr(sae, 'normalize_decoder_'):
                     sae.normalize_decoder_()
 
                 epoch_loss += loss.item()
-                epoch_recon_loss += loss_dict.get('recon_loss', loss_dict['total_loss']).item()
-                if 'aux_loss' in loss_dict:
-                    epoch_aux_loss += loss_dict['aux_loss'].item()
+                epoch_recon_loss += loss_dict.get('reconstruction_loss', loss_dict['total_loss']).item()
+                if 'sparsity_loss' in loss_dict:
+                    epoch_aux_loss += loss_dict['sparsity_loss'].item()
                 n_batches += 1
                 epoch_samples += batch_size
                 global_step += 1
@@ -412,17 +423,17 @@ def train_sae(
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(sae.parameters(), 1.0)
                 optimizer.step()
+                scheduler.step()
 
                 if hasattr(sae, 'normalize_decoder_'):
                     sae.normalize_decoder_()
 
                 epoch_loss += loss.item()
-                epoch_recon_loss += loss_dict.get('recon_loss', loss_dict['total_loss']).item()
-                if 'aux_loss' in loss_dict:
-                    epoch_aux_loss += loss_dict['aux_loss'].item()
+                epoch_recon_loss += loss_dict.get('reconstruction_loss', loss_dict['total_loss']).item()
+                if 'sparsity_loss' in loss_dict:
+                    epoch_aux_loss += loss_dict['sparsity_loss'].item()
                 n_batches += 1
 
-        scheduler.step()
 
         if n_batches == 0:
             logger.warning(f"Epoch {epoch+1}: No batches processed!")
