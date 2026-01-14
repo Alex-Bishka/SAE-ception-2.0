@@ -134,9 +134,8 @@ class TopKSparseAutoencoder(nn.Module):
         pre_acts = self.encode_pre_act(x)
         pre_acts_relu = F.relu(pre_acts)
         topk_values, topk_indices = torch.topk(pre_acts_relu, k=self.k, dim=-1)
-        
-        sparse_code = torch.zeros_like(pre_acts)
-        sparse_code.scatter_(dim=-1, index=topk_indices, src=topk_values)
+
+        sparse_code = torch.zeros_like(pre_acts).scatter(dim=-1, index=topk_indices, src=topk_values)
         return sparse_code
 
     def decode(self, sparse_code: torch.Tensor) -> torch.Tensor:
@@ -152,9 +151,8 @@ class TopKSparseAutoencoder(nn.Module):
         pre_acts_relu = F.relu(pre_acts)
         topk_values, topk_indices = torch.topk(pre_acts_relu, k=self.k, dim=-1)
         
-        # 3. Create Sparse Code
-        sparse_code = torch.zeros_like(pre_acts)
-        sparse_code.scatter_(dim=-1, index=topk_indices, src=topk_values)
+        # 3. Create Sparse Code (use scatter, not scatter_ to preserve gradients)
+        sparse_code = torch.zeros_like(pre_acts).scatter(dim=-1, index=topk_indices, src=topk_values)
         
         # 4. Decode
         reconstruction = self.decode(sparse_code)
@@ -221,9 +219,8 @@ class TopKSparseAutoencoder(nn.Module):
                     aux_vals, aux_inds = torch.topk(dead_pre_acts, k=k_aux, dim=-1)
                     aux_vals = F.relu(aux_vals)
                     
-                    # Create sparse code for aux features
-                    aux_sparse = torch.zeros_like(pre_acts)
-                    aux_sparse.scatter_(-1, aux_inds, aux_vals)
+                    # Create sparse code for aux features (non-in-place to preserve gradients)
+                    aux_sparse = torch.zeros_like(pre_acts).scatter(-1, aux_inds, aux_vals)
                     
                     # Decode aux features
                     aux_recon = self.decode(aux_sparse)
