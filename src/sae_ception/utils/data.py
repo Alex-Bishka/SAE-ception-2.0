@@ -473,11 +473,11 @@ def stream_activations(
     Yields:
         torch.Tensor: Batch of activations [batch_tokens, hidden_dim]
     """
-    from sae_ception.utils.hooks import ActivationExtractor
+    from sae_ception.utils.hooks import extract_layer_output
 
     model.eval()
     layer_name = str(layer_idx)
-    extractor = ActivationExtractor(model, [layer_name])
+    cache = extract_layer_output(model, layer_name)
 
     total_tokens = 0
     pbar = tqdm(dataloader, desc="Streaming activations", disable=not show_progress)
@@ -492,8 +492,9 @@ def stream_activations(
             # Forward pass to capture activations
             _ = model(input_ids, attention_mask=attention_mask)
 
-            # Get activations from cache
-            acts = extractor.cache[layer_name]  # [batch, seq_len, hidden]
+            # Get activations from cache (hook stores as "layer_{idx}")
+            cache_key = f"layer_{layer_idx}"
+            acts = cache.activations[cache_key]  # [batch, seq_len, hidden]
 
             batch_size, seq_len, hidden_dim = acts.shape
 
@@ -511,7 +512,7 @@ def stream_activations(
             mask_flat = mask.view(-1)
             acts_flat = acts.view(-1, hidden_dim)[mask_flat]
 
-            extractor.cache.clear()
+            cache.clear()
 
             # Check if we've hit the limit
             if max_tokens is not None:
@@ -530,7 +531,7 @@ def stream_activations(
             if max_tokens is not None and total_tokens >= max_tokens:
                 break
 
-    extractor.remove_hooks()
+    cache.remove_hooks()
 
 
 class StreamingActivationDataset(torch.utils.data.IterableDataset):
