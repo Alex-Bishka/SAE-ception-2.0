@@ -25,9 +25,7 @@ from pathlib import Path
 from transformers import AutoModelForCausalLM, AutoTokenizer
 import logging
 from typing import Dict, Optional
-from tqdm import tqdm
 import json
-import math
 
 try:
     import wandb
@@ -36,11 +34,9 @@ except ImportError:
     WANDB_AVAILABLE = False
 
 from sae_ception.models.sae import create_sae
-from sae_ception.utils.hooks import ActivationExtractor
 from sae_ception.utils.data import (
     create_causal_lm_dataloader,
-    extract_activations_all_tokens,
-    create_activation_dataloader,
+    stream_activations,
 )
 
 logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
@@ -215,54 +211,32 @@ def train_sae(
     hidden_size: int,
     expansion_factor: int = 8,
     k: int = 32,
-    n_samples: int = 50000,
-    n_epochs: int = 50,
-    batch_size: int = 256,
+    n_samples: int = 10000000,
+    n_epochs: int = 4,
+    batch_size: int = 4096,
     lr: float = 3e-4,
     device: str = 'cuda',
     output_path: Optional[str] = None,
     dataset_name: str = 'wikitext',
     wandb_run=None,
+    # Resampling options
+    resampling: bool = False,
+    resampling_interval: int = 500,
+    resampling_stop: float = 0.5,
+    # Checkpoint options
+    checkpoint_interval: int = 10,
 ) -> torch.nn.Module:
-    """Train an SAE with proper hyperparameters."""
+    """Train an SAE with streaming activation extraction (memory-efficient).
 
+    Instead of extracting all activations upfront (which causes OOM for large
+    datasets), this streams activations batch-by-batch during training.
+
+    Saves periodic checkpoints every checkpoint_interval% of training for
+    Pareto frontier evaluation.
+    """
     sae_hidden = hidden_size * expansion_factor
 
-    # Extract activations
-    logger.info(f"Extracting activations from layer {layer_idx}...")
-    logger.info(f"Target: {n_samples} samples from {dataset_name}")
-
-    # Estimate how many sequences we need
-    seq_len = 512
-    avg_tokens_per_sample = seq_len * 0.7  # Account for padding
-    n_sequences = int(n_samples / avg_tokens_per_sample) + 100  # Extra buffer
-
-    train_loader = create_causal_lm_dataloader(
-        tokenizer=tokenizer,
-        dataset_name=dataset_name,
-        split='train',
-        batch_size=8,
-        max_length=seq_len,
-        max_samples=n_sequences,
-    )
-    
-    acts, token_ids, _ = extract_activations_all_tokens(
-        model=model,
-        dataloader=train_loader,
-        layer_name=str(layer_idx),
-        device=device,
-        include_padding=False,  # Don't include padding tokens
-    )
-    
-    logger.info(f"Extracted {len(acts)} token activations")
-    
-    # Limit to n_samples if we got more
-    if len(acts) > n_samples:
-        indices = torch.randperm(len(acts))[:n_samples]
-        acts = acts[indices]
-        logger.info(f"Subsampled to {len(acts)} activations")
-    
-    # Create SAE
+    # Create SAE first
     sae = create_sae(
         input_dim=hidden_size,
         hidden_dim=sae_hidden,
@@ -270,106 +244,56 @@ def train_sae(
         k=k,
     )
     sae.to(device)
-    
-    # Create dataloader for SAE training
-    dummy_labels = torch.zeros(len(acts), dtype=torch.long)
-    act_loader = create_activation_dataloader(
-        activations=acts,
-        labels=dummy_labels,
-        batch_size=batch_size,
-        shuffle=True,
-    )
-    
+
     # Optimizer and scheduler
     optimizer = Adam(sae.parameters(), lr=lr, betas=(0.9, 0.999))
     scheduler = CosineAnnealingLR(optimizer, T_max=n_epochs, eta_min=lr * 0.1)
-    
-    # Training loop
-    logger.info(f"\nTraining SAE for {n_epochs} epochs...")
+
+    # Setup checkpoint directory
+    checkpoint_dir = None
+    if output_path:
+        checkpoint_dir = Path(output_path)
+        if checkpoint_dir.suffix:  # If it's a file path, use parent dir
+            checkpoint_dir = checkpoint_dir.parent / checkpoint_dir.stem
+        checkpoint_dir.mkdir(parents=True, exist_ok=True)
+
+    # Calculate total steps for checkpoint scheduling
+    total_steps = (n_samples * n_epochs) // batch_size
+    checkpoint_every = max(1, total_steps * checkpoint_interval // 100)
+    resampling_stop_step = int(total_steps * resampling_stop)
+
+    logger.info(f"\nTraining SAE (streaming mode)...")
+    logger.info(f"  Target samples: {n_samples:,}")
+    logger.info(f"  Epochs: {n_epochs} (total tokens: {n_samples * n_epochs:,})")
     logger.info(f"  Hidden dim: {sae_hidden} ({expansion_factor}x)")
     logger.info(f"  k (TopK): {k}")
     logger.info(f"  Batch size: {batch_size}")
     logger.info(f"  Learning rate: {lr}")
-    
+    logger.info(f"  Dataset: {dataset_name}")
+    logger.info(f"  Total steps: ~{total_steps:,}")
+    logger.info(f"  Checkpoint every: {checkpoint_every} steps ({checkpoint_interval}%)")
+    if resampling:
+        logger.info(f"  Resampling: enabled (interval={resampling_interval}, stop at step {resampling_stop_step})")
+
+    # Setup data loader - estimate sequences needed
+    seq_len = 512
+    avg_tokens_per_seq = seq_len * 0.7  # Account for padding
+    n_sequences = int(n_samples / avg_tokens_per_seq) + 100
+
     best_loss = float('inf')
     best_state = None
-    
-    sae.train()
-    for epoch in range(n_epochs):
-        epoch_loss = 0
-        epoch_recon_loss = 0
-        epoch_aux_loss = 0
-        n_batches = 0
-        
-        for batch in act_loader:
-            x = batch['activations'].to(device)
-            
-            # Forward pass
-            recon, sparse, info = sae(x)
-            loss_dict = sae.loss(x, recon, sparse, info)
-            loss = loss_dict['total_loss']
-            
-            # Backward pass
-            optimizer.zero_grad()
-            loss.backward()
-            
-            # Gradient clipping
-            torch.nn.utils.clip_grad_norm_(sae.parameters(), 1.0)
-            
-            optimizer.step()
-            
-            # Normalize decoder columns
-            if hasattr(sae, 'normalize_decoder_'):
-                sae.normalize_decoder_()
-            
-            epoch_loss += loss.item()
-            epoch_recon_loss += loss_dict.get('recon_loss', loss_dict['total_loss']).item()
-            if 'aux_loss' in loss_dict:
-                epoch_aux_loss += loss_dict['aux_loss'].item()
-            n_batches += 1
-        
-        scheduler.step()
-        
-        avg_loss = epoch_loss / n_batches
-        avg_recon = epoch_recon_loss / n_batches
-        avg_aux = epoch_aux_loss / n_batches if epoch_aux_loss > 0 else 0
-        
-        # Track best
-        if avg_loss < best_loss:
-            best_loss = avg_loss
-            best_state = {k: v.cpu().clone() for k, v in sae.state_dict().items()}
-        
-        # Logging
-        if (epoch + 1) % 5 == 0 or epoch == 0:
-            logger.info(
-                f"  Epoch {epoch+1:3d}/{n_epochs}: "
-                f"loss={avg_loss:.4f} (recon={avg_recon:.4f}, aux={avg_aux:.4f}), "
-                f"lr={scheduler.get_last_lr()[0]:.2e}"
-            )
+    total_samples_seen = 0
+    global_step = 0
+    next_checkpoint_step = checkpoint_every
+    saved_checkpoints = []
 
-        # W&B logging
-        if wandb_run is not None:
-            wandb_run.log({
-                'epoch': epoch + 1,
-                'train/loss': avg_loss,
-                'train/recon_loss': avg_recon,
-                'train/aux_loss': avg_aux,
-                'train/lr': scheduler.get_last_lr()[0],
-            })
-    
-    # Load best state
-    if best_state is not None:
-        sae.load_state_dict({k: v.to(device) for k, v in best_state.items()})
-        logger.info(f"\nLoaded best checkpoint (loss={best_loss:.4f})")
-    
-    sae.eval()
-    
-    # Save checkpoint
-    if output_path:
-        output_path = Path(output_path)
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        
-        checkpoint = {
+    def save_checkpoint(step: int, is_final: bool = False):
+        """Save checkpoint with current metrics."""
+        if checkpoint_dir is None:
+            return
+        name = "final.pt" if is_final else f"step_{step:06d}.pt"
+        ckpt_path = checkpoint_dir / name
+        ckpt = {
             'model_state_dict': sae.state_dict(),
             'config': {
                 'input_dim': hidden_size,
@@ -379,15 +303,180 @@ def train_sae(
                 'layer_idx': layer_idx,
             },
             'training': {
-                'n_samples': len(acts),
+                'step': step,
+                'total_samples': total_samples_seen,
                 'n_epochs': n_epochs,
-                'best_loss': best_loss,
+                'loss': best_loss,
             }
         }
-        torch.save(checkpoint, output_path)
-        logger.info(f"Saved checkpoint to {output_path}")
-    
-    return sae, acts
+        torch.save(ckpt, ckpt_path)
+        saved_checkpoints.append(str(ckpt_path))
+        logger.info(f"  Saved checkpoint: {ckpt_path}")
+
+    for epoch in range(n_epochs):
+        # Create fresh dataloader each epoch for streaming datasets
+        train_loader = create_causal_lm_dataloader(
+            tokenizer=tokenizer,
+            dataset_name=dataset_name,
+            split='train',
+            batch_size=64,  # Larger batch OK with streaming (no OOM risk)
+            max_length=seq_len,
+            max_samples=n_sequences,
+        )
+
+        epoch_loss = 0
+        epoch_recon_loss = 0
+        epoch_aux_loss = 0
+        n_batches = 0
+        epoch_samples = 0
+
+        sae.train()
+        activation_buffer = []
+
+        for act_batch in stream_activations(
+            model=model,
+            dataloader=train_loader,
+            layer_idx=layer_idx,
+            device=device,
+            max_tokens=n_samples,
+            show_progress=(epoch == 0),  # Only show progress on first epoch
+        ):
+            # Accumulate until we have enough for a training batch
+            activation_buffer.append(act_batch.cpu())
+            buffer_size = sum(a.shape[0] for a in activation_buffer)
+
+            if buffer_size >= batch_size:
+                # Concatenate and take a batch
+                all_acts = torch.cat(activation_buffer, dim=0)
+                x = all_acts[:batch_size].to(device)
+
+                # Keep remainder in buffer
+                if all_acts.shape[0] > batch_size:
+                    activation_buffer = [all_acts[batch_size:]]
+                else:
+                    activation_buffer = []
+
+                # Forward pass
+                recon, sparse, info = sae(x)
+                loss_dict = sae.loss(x, recon, sparse, info)
+                loss = loss_dict['total_loss']
+
+                # Backward pass
+                optimizer.zero_grad()
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(sae.parameters(), 1.0)
+                optimizer.step()
+
+                # Normalize decoder columns
+                if hasattr(sae, 'normalize_decoder_'):
+                    sae.normalize_decoder_()
+
+                epoch_loss += loss.item()
+                epoch_recon_loss += loss_dict.get('recon_loss', loss_dict['total_loss']).item()
+                if 'aux_loss' in loss_dict:
+                    epoch_aux_loss += loss_dict['aux_loss'].item()
+                n_batches += 1
+                epoch_samples += batch_size
+                global_step += 1
+
+                # Periodic checkpoint saving
+                if global_step >= next_checkpoint_step:
+                    save_checkpoint(global_step)
+                    next_checkpoint_step += checkpoint_every
+
+                # Resampling (if enabled and before stop point)
+                if resampling and global_step % resampling_interval == 0:
+                    if global_step < resampling_stop_step:
+                        if hasattr(sae, 'resample_dead_neurons'):
+                            n_resampled = sae.resample_dead_neurons(
+                                activations=x,
+                                optimizer=optimizer,
+                            )
+                            if n_resampled > 0:
+                                logger.info(f"  Step {global_step}: resampled {n_resampled} dead neurons")
+
+            # Early stop if we've hit target
+            if epoch_samples >= n_samples:
+                break
+
+        # Handle remaining buffer
+        if activation_buffer and len(activation_buffer) > 0:
+            remaining = torch.cat(activation_buffer, dim=0)
+            if remaining.shape[0] >= 32:  # Only if enough for a mini-batch
+                x = remaining.to(device)
+                recon, sparse, info = sae(x)
+                loss_dict = sae.loss(x, recon, sparse, info)
+                loss = loss_dict['total_loss']
+
+                optimizer.zero_grad()
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(sae.parameters(), 1.0)
+                optimizer.step()
+
+                if hasattr(sae, 'normalize_decoder_'):
+                    sae.normalize_decoder_()
+
+                epoch_loss += loss.item()
+                epoch_recon_loss += loss_dict.get('recon_loss', loss_dict['total_loss']).item()
+                if 'aux_loss' in loss_dict:
+                    epoch_aux_loss += loss_dict['aux_loss'].item()
+                n_batches += 1
+
+        scheduler.step()
+
+        if n_batches == 0:
+            logger.warning(f"Epoch {epoch+1}: No batches processed!")
+            continue
+
+        avg_loss = epoch_loss / n_batches
+        avg_recon = epoch_recon_loss / n_batches
+        avg_aux = epoch_aux_loss / n_batches if epoch_aux_loss > 0 else 0
+
+        total_samples_seen += epoch_samples
+
+        # Track best
+        if avg_loss < best_loss:
+            best_loss = avg_loss
+            best_state = {k: v.cpu().clone() for k, v in sae.state_dict().items()}
+
+        # Logging
+        logger.info(
+            f"  Epoch {epoch+1:3d}/{n_epochs}: "
+            f"loss={avg_loss:.4f} (recon={avg_recon:.4f}, aux={avg_aux:.4f}), "
+            f"samples={epoch_samples:,}, lr={scheduler.get_last_lr()[0]:.2e}"
+        )
+
+        # W&B logging
+        if wandb_run is not None:
+            wandb_run.log({
+                'epoch': epoch + 1,
+                'train/loss': avg_loss,
+                'train/recon_loss': avg_recon,
+                'train/aux_loss': avg_aux,
+                'train/lr': scheduler.get_last_lr()[0],
+                'train/samples_this_epoch': epoch_samples,
+                'train/total_samples': total_samples_seen,
+            })
+
+    # Load best state
+    if best_state is not None:
+        sae.load_state_dict({k: v.to(device) for k, v in best_state.items()})
+        logger.info(f"\nLoaded best checkpoint (loss={best_loss:.4f})")
+
+    sae.eval()
+
+    # Save final checkpoint
+    save_checkpoint(global_step, is_final=True)
+
+    logger.info(f"\nTraining complete!")
+    logger.info(f"  Total steps: {global_step}")
+    logger.info(f"  Total samples: {total_samples_seen:,}")
+    logger.info(f"  Best loss: {best_loss:.4f}")
+    if checkpoint_dir:
+        logger.info(f"  Checkpoints saved to: {checkpoint_dir}/")
+        logger.info(f"  Use evaluate_sae_checkpoints.py for Pareto frontier evaluation")
+
+    return sae, checkpoint_dir
 
 
 def main():
@@ -397,16 +486,23 @@ def main():
     parser.add_argument('--layer', type=int, default=3)
     parser.add_argument('--expansion', type=int, default=8)
     parser.add_argument('--k', type=int, default=32, help='TopK sparsity')
-    parser.add_argument('--samples', type=int, default=500000, help='Number of token activations')
-    parser.add_argument('--epochs', type=int, default=50)
-    parser.add_argument('--batch-size', type=int, default=256)
+    parser.add_argument('--samples', type=int, default=10000000, help='Number of token activations')
+    parser.add_argument('--epochs', type=int, default=4)
+    parser.add_argument('--batch-size', type=int, default=4096)
     parser.add_argument('--lr', type=float, default=3e-4)
-    parser.add_argument('--output', type=str, default=None, help='Output checkpoint path')
+    parser.add_argument('--output', type=str, default=None, help='Output checkpoint dir (will save periodic checkpoints)')
     parser.add_argument('--checkpoint', type=str, default=None, help='Load existing checkpoint')
     parser.add_argument('--diagnose-only', action='store_true', help='Only run diagnostics')
     parser.add_argument('--quick', action='store_true', help='Quick test (10k samples, 10 epochs)')
     parser.add_argument('--dataset', type=str, default='wikitext', help='Dataset name (wikitext, pile, etc.)')
     parser.add_argument('--device', type=str, default='cuda')
+    # Resampling options
+    parser.add_argument('--resampling', action='store_true', help='Enable dead neuron resampling (aux-k)')
+    parser.add_argument('--resampling-interval', type=int, default=500, help='Steps between resampling attempts')
+    parser.add_argument('--resampling-stop', type=float, default=0.5, help='Stop resampling after this fraction of training')
+    # Checkpoint options
+    parser.add_argument('--checkpoint-interval', type=int, default=10, help='Save checkpoint every N%% of training')
+    # W&B options
     parser.add_argument('--wandb', action='store_true', help='Enable Weights & Biases logging')
     parser.add_argument('--wandb-project', type=str, default='sae-ception', help='W&B project name')
     parser.add_argument('--wandb-run-name', type=str, default=None, help='W&B run name (auto-generated if not set)')
@@ -490,83 +586,54 @@ def main():
     logger.info(f"Hidden size: {hidden_size}")
     
     # Either load or train SAE
-    if args.checkpoint and Path(args.checkpoint).exists():
-        logger.info(f"Loading SAE from {args.checkpoint}")
-        checkpoint = torch.load(args.checkpoint, map_location=args.device)
-        
-        config = checkpoint.get('config', {})
-        sae = create_sae(
-            input_dim=config.get('input_dim', hidden_size),
-            hidden_dim=config.get('hidden_dim', hidden_size * args.expansion),
-            sae_type='topk',
-            k=config.get('k', args.k),
-        )
-        sae.load_state_dict(checkpoint['model_state_dict'])
-        sae.to(args.device)
-        
-        # Get activations for diagnostics
-        logger.info("Extracting activations for diagnostics...")
-        train_loader = create_causal_lm_dataloader(
-            tokenizer=tokenizer,
-            dataset_name='wikitext',
-            split='test',  # Use test set for diagnostics
-            batch_size=8,
-            max_length=512,
-            max_samples=1000,
-        )
-        acts, _, _ = extract_activations_all_tokens(
-            model=model,
-            dataloader=train_loader,
-            layer_name=str(args.layer),
-            device=args.device,
-        )
-    else:
-        if args.diagnose_only:
+    if args.diagnose_only:
+        if not args.checkpoint:
             logger.error("--diagnose-only requires --checkpoint")
             return
-        
-        sae, acts = train_sae(
-            model=model,
-            tokenizer=tokenizer,
-            layer_idx=args.layer,
-            hidden_size=hidden_size,
-            expansion_factor=args.expansion,
-            k=args.k,
-            n_samples=args.samples,
-            n_epochs=args.epochs,
-            batch_size=args.batch_size,
-            lr=args.lr,
-            device=args.device,
-            output_path=args.output,
-            dataset_name=args.dataset,
-            wandb_run=wandb_run,
-        )
-    
-    # Run diagnostics
-    logger.info("\nRunning diagnostics...")
-    metrics = diagnose_sae(sae, acts, device=args.device)
-    is_good = print_diagnostics(metrics, expected_k=args.k)
-    
-    # Save diagnostics
-    if args.output:
-        diag_path = Path(args.output).with_suffix('.diagnostics.json')
-        with open(diag_path, 'w') as f:
-            json.dump(metrics, f, indent=2)
-        logger.info(f"Diagnostics saved to {diag_path}")
+        logger.info("For diagnostics, use evaluate_sae_checkpoints.py instead:")
+        logger.info(f"  python scripts/evaluate_sae_checkpoints.py \\")
+        logger.info(f"    --checkpoint-dir {Path(args.checkpoint).parent} \\")
+        logger.info(f"    --model {args.model} --layer {args.layer}")
+        return
 
-    # Log final diagnostics to W&B
+    if args.checkpoint and Path(args.checkpoint).exists():
+        logger.info(f"Resuming from checkpoint: {args.checkpoint}")
+        # TODO: implement checkpoint resumption if needed
+        logger.warning("Checkpoint resumption not yet implemented, starting fresh")
+
+    # Train new SAE
+    sae, checkpoint_dir = train_sae(
+        model=model,
+        tokenizer=tokenizer,
+        layer_idx=args.layer,
+        hidden_size=hidden_size,
+        expansion_factor=args.expansion,
+        k=args.k,
+        n_samples=args.samples,
+        n_epochs=args.epochs,
+        batch_size=args.batch_size,
+        lr=args.lr,
+        device=args.device,
+        output_path=args.output,
+        dataset_name=args.dataset,
+        wandb_run=wandb_run,
+        resampling=args.resampling,
+        resampling_interval=args.resampling_interval,
+        resampling_stop=args.resampling_stop,
+        checkpoint_interval=args.checkpoint_interval,
+    )
+
+    # Finish W&B run
     if wandb_run is not None:
-        wandb_run.log({
-            'diagnostics/l0_sparsity': metrics.get('l0_sparsity', 0),
-            'diagnostics/dead_features_pct': metrics.get('dead_features_pct', 0),
-            'diagnostics/mean_cosine_sim': metrics.get('mean_cosine_sim', 0),
-            'diagnostics/reconstruction_mse': metrics.get('reconstruction_mse', 0),
-            'diagnostics/relative_reconstruction_error': metrics.get('relative_reconstruction_error', 0),
-        })
         wandb_run.finish()
         logger.info("W&B run finished")
 
-    return is_good
+    # Print next steps
+    if checkpoint_dir:
+        logger.info(f"\nNext: Run Pareto frontier evaluation:")
+        logger.info(f"  python scripts/evaluate_sae_checkpoints.py \\")
+        logger.info(f"    --checkpoint-dir {checkpoint_dir} \\")
+        logger.info(f"    --model {args.model} --layer {args.layer}")
 
 
 if __name__ == "__main__":

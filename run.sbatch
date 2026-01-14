@@ -49,14 +49,32 @@ if torch.cuda.is_available():
 PY
 
 # ============================================================
-# Step 2: Train SAE on Pretrained Pythia-410M
+# Step 1: Train SAE on Pretrained Pythia-410M
 # ============================================================
+# Training config (based on best practices):
+# - 10M unique tokens, 4 epochs = 40M total tokens seen
+# - Batch size 4096, ~10k steps total
+# - Resampling enabled, stops at 50% of training
+# - Saves checkpoints every 10% for Pareto frontier selection
 uv run python scripts/train_sae_pretrained.py \
   --model EleutherAI/pythia-410m \
   --layer 12 \
   --samples 10000000 \
-  --epochs 1 \
+  --epochs 4 \
+  --batch-size 4096 \
   --k 32 \
   --dataset pile \
+  --resampling \
   --wandb \
-  --output checkpoints/sae_pythia410m_k32.pt
+  --output checkpoints/sae_pythia410m_k32
+
+# ============================================================
+# Step 2: Evaluate checkpoints for Pareto frontier
+# ============================================================
+uv run python scripts/evaluate_sae_checkpoints.py \
+  --checkpoint-dir checkpoints/sae_pythia410m_k32 \
+  --model EleutherAI/pythia-410m \
+  --layer 12 \
+  --test-samples 500000 \
+  --output results/pareto_k32.json \
+  --plot results/pareto_k32.png

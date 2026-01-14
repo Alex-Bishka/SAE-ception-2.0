@@ -441,6 +441,134 @@ def create_activation_dataloader(
         pin_memory=True,
     )
 
+
+# =============================================================================
+# STREAMING ACTIVATION EXTRACTION (Memory-efficient for large datasets)
+# =============================================================================
+
+def stream_activations(
+    model: torch.nn.Module,
+    dataloader: DataLoader,
+    layer_idx: int,
+    device: str = 'cuda',
+    max_tokens: Optional[int] = None,
+    show_progress: bool = True,
+    exclude_bos: bool = False,
+):
+    """
+    Generator that yields batches of activations on-the-fly.
+
+    This is memory-efficient as it doesn't store all activations at once.
+    Each yield returns a batch of token activations extracted from the model.
+
+    Args:
+        model: The language model
+        dataloader: DataLoader yielding tokenized text batches
+        layer_idx: Which layer to extract activations from
+        device: Device to run on
+        max_tokens: Maximum number of tokens to yield (None = unlimited)
+        show_progress: Whether to show progress bar
+        exclude_bos: If True, exclude position 0 (BOS) tokens from each sequence
+
+    Yields:
+        torch.Tensor: Batch of activations [batch_tokens, hidden_dim]
+    """
+    from sae_ception.utils.hooks import ActivationExtractor
+
+    model.eval()
+    layer_name = str(layer_idx)
+    extractor = ActivationExtractor(model, [layer_name])
+
+    total_tokens = 0
+    pbar = tqdm(dataloader, desc="Streaming activations", disable=not show_progress)
+
+    with torch.no_grad():
+        for batch in pbar:
+            input_ids = batch['input_ids'].to(device)
+            attention_mask = batch.get('attention_mask', None)
+            if attention_mask is not None:
+                attention_mask = attention_mask.to(device)
+
+            # Forward pass to capture activations
+            _ = model(input_ids, attention_mask=attention_mask)
+
+            # Get activations from cache
+            acts = extractor.cache[layer_name]  # [batch, seq_len, hidden]
+
+            batch_size, seq_len, hidden_dim = acts.shape
+
+            # Build mask for valid tokens
+            if attention_mask is not None:
+                mask = attention_mask.bool()  # [batch, seq_len]
+            else:
+                mask = torch.ones(batch_size, seq_len, dtype=torch.bool, device=device)
+
+            # Exclude BOS (position 0) if requested
+            if exclude_bos:
+                mask[:, 0] = False
+
+            # Flatten and apply mask
+            mask_flat = mask.view(-1)
+            acts_flat = acts.view(-1, hidden_dim)[mask_flat]
+
+            extractor.cache.clear()
+
+            # Check if we've hit the limit
+            if max_tokens is not None:
+                remaining = max_tokens - total_tokens
+                if remaining <= 0:
+                    break
+                if len(acts_flat) > remaining:
+                    acts_flat = acts_flat[:remaining]
+
+            total_tokens += len(acts_flat)
+            if show_progress:
+                pbar.set_postfix({'tokens': total_tokens})
+
+            yield acts_flat
+
+            if max_tokens is not None and total_tokens >= max_tokens:
+                break
+
+    extractor.remove_hooks()
+
+
+class StreamingActivationDataset(torch.utils.data.IterableDataset):
+    """
+    Iterable dataset that streams activations from a model.
+
+    This wraps stream_activations for use with DataLoader.
+    Note: Due to streaming nature, len() is not available.
+    """
+
+    def __init__(
+        self,
+        model: torch.nn.Module,
+        text_dataloader: DataLoader,
+        layer_idx: int,
+        device: str = 'cuda',
+        max_tokens: Optional[int] = None,
+    ):
+        self.model = model
+        self.text_dataloader = text_dataloader
+        self.layer_idx = layer_idx
+        self.device = device
+        self.max_tokens = max_tokens
+
+    def __iter__(self):
+        for batch in stream_activations(
+            model=self.model,
+            dataloader=self.text_dataloader,
+            layer_idx=self.layer_idx,
+            device=self.device,
+            max_tokens=self.max_tokens,
+            show_progress=False,
+        ):
+            # Yield individual samples for DataLoader to batch
+            for i in range(len(batch)):
+                yield batch[i]
+
+
 # =============================================================================
 # CAUSAL LM DATA LOADING (NEW - for CPT experiments)
 # =============================================================================
@@ -551,12 +679,19 @@ def create_causal_lm_dataloader(
         )
     elif dataset_name == 'pile':
         # Use the batched pile loader which pre-downloads samples
+        # train: 0-10M samples, test: 20M+ (held-out for Pareto evaluation)
+        skip = 0
+        if split == 'test':
+            skip = 20_000_000  # Held-out test set, well past training data
+            print(f"Test (held-out): skipping first {skip:,} Pile samples")
+
         return create_pile_dataloader_batched(
             tokenizer=tokenizer,
             batch_size=batch_size,
             max_length=max_length,
             max_samples=max_samples or 100000,
             num_workers=num_workers,
+            skip_samples=skip,
         )
     else:
         raise ValueError(f"Unknown dataset: {dataset_name}. Supported: wikitext, pile")
@@ -669,14 +804,15 @@ def create_pile_dataloader_batched(
     max_samples: int = 100000,
     num_workers: int = 4,
     seed: int = 42,
+    skip_samples: int = 0,
 ) -> DataLoader:
     """
     Create a DataLoader for The Pile by pre-loading samples.
-    
+
     This loads a fixed number of samples into memory, which allows
     proper shuffling and multi-worker loading. Better for training
     but requires more memory.
-    
+
     Args:
         tokenizer: Tokenizer
         batch_size: Batch size
@@ -684,23 +820,33 @@ def create_pile_dataloader_batched(
         max_samples: Number of samples to load
         num_workers: DataLoader workers
         seed: Random seed
-        
+        skip_samples: Number of samples to skip (for validation offset)
+
     Returns:
         DataLoader with pre-loaded Pile samples
     """
     from datasets import load_dataset
     import torch
-    
-    print(f"Loading {max_samples} samples from The Pile...")
-    
-    # Load streaming and take samples
+
+    skip_msg = f" (skipping first {skip_samples:,})" if skip_samples > 0 else ""
+    print(f"Loading {max_samples:,} samples from The Pile{skip_msg}...")
+
+    # Load streaming dataset
     dataset = load_dataset(
         "monology/pile-uncopyrighted",
         split="train",
         streaming=True,
     )
+
+    # Skip samples efficiently using HuggingFace's .skip() method
+    # This doesn't load skipped samples, just advances the iterator
+    if skip_samples > 0:
+        print(f"  Skipping {skip_samples:,} samples (this may take a moment)...")
+        dataset = dataset.skip(skip_samples)
+
+    # Shuffle after skip (so validation gets different ordering than if we hadn't skipped)
     dataset = dataset.shuffle(seed=seed, buffer_size=10000)
-    
+
     # Collect samples
     texts = []
     for i, example in enumerate(dataset):
@@ -709,7 +855,7 @@ def create_pile_dataloader_batched(
         if len(example["text"].strip()) > 0:
             texts.append(example["text"])
         if (i + 1) % 10000 == 0:
-            print(f"  Loaded {i + 1} samples...")
+            print(f"  Loaded {len(texts):,} samples...")
     
     print(f"Loaded {len(texts)} non-empty samples")
     
