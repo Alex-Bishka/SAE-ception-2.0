@@ -482,14 +482,14 @@ def stream_activations(
     total_tokens = 0
     pbar = tqdm(dataloader, desc="Streaming activations", disable=not show_progress)
 
-    with torch.no_grad():
-        for batch in pbar:
-            input_ids = batch['input_ids'].to(device)
-            attention_mask = batch.get('attention_mask', None)
-            if attention_mask is not None:
-                attention_mask = attention_mask.to(device)
+    for batch in pbar:
+        input_ids = batch['input_ids'].to(device)
+        attention_mask = batch.get('attention_mask', None)
+        if attention_mask is not None:
+            attention_mask = attention_mask.to(device)
 
-            # Forward pass to capture activations
+        # Forward pass to capture activations (no grad for LM only)
+        with torch.no_grad():
             _ = model(input_ids, attention_mask=attention_mask)
 
             # Get activations from cache (hook stores as "layer_{idx}")
@@ -514,22 +514,23 @@ def stream_activations(
 
             cache.clear()
 
-            # Check if we've hit the limit
-            if max_tokens is not None:
-                remaining = max_tokens - total_tokens
-                if remaining <= 0:
-                    break
-                if len(acts_flat) > remaining:
-                    acts_flat = acts_flat[:remaining]
-
-            total_tokens += len(acts_flat)
-            if show_progress:
-                pbar.set_postfix({'tokens': total_tokens})
-
-            yield acts_flat
-
-            if max_tokens is not None and total_tokens >= max_tokens:
+        # Check if we've hit the limit
+        if max_tokens is not None:
+            remaining = max_tokens - total_tokens
+            if remaining <= 0:
                 break
+            if len(acts_flat) > remaining:
+                acts_flat = acts_flat[:remaining]
+
+        total_tokens += len(acts_flat)
+        if show_progress:
+            pbar.set_postfix({'tokens': total_tokens})
+
+        # Yield OUTSIDE of no_grad so caller can use gradients
+        yield acts_flat
+
+        if max_tokens is not None and total_tokens >= max_tokens:
+            break
 
     cache.remove_hooks()
 
