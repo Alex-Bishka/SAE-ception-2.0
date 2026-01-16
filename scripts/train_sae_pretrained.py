@@ -483,7 +483,8 @@ def train_sae(
                 if 'sparsity_loss' in loss_dict:
                     epoch_aux_loss += loss_dict['sparsity_loss'].item()
                 n_batches += 1
-
+                global_step += 1
+                epoch_samples += remaining.shape[0]
 
         # End-of-epoch cleanup
         activation_buffer = []

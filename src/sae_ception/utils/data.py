@@ -527,7 +527,8 @@ def stream_activations(
             pbar.set_postfix({'tokens': total_tokens})
 
         # Yield OUTSIDE of no_grad so caller can use gradients
-        yield acts_flat
+        # Clone to release the source tensor's storage and prevent memory accumulation
+        yield acts_flat.clone()
 
         if max_tokens is not None and total_tokens >= max_tokens:
             break
