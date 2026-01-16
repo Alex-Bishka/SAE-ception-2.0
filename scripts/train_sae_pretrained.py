@@ -379,8 +379,11 @@ def train_sae(
             activation_buffer.append(act_batch.detach().clone().cpu())
             buffer_size = sum(a.shape[0] for a in activation_buffer)
 
-            if buffer_size >= batch_size:
-                # Concatenate and take a batch
+            # FIX: Use while loop to drain ALL available batches from buffer
+            # Before this fix, the 'if' only processed ONE batch per iteration,
+            # causing ~28k tokens to accumulate each time (32k produced - 4k consumed)
+            while buffer_size >= batch_size:
+                # Concatenate buffer into one tensor
                 all_acts = torch.cat(activation_buffer, dim=0)
                 x = all_acts[:batch_size].to(device)
 
@@ -394,6 +397,9 @@ def train_sae(
 
                 # Explicitly free the large tensor
                 del all_acts
+
+                # Update buffer_size for while loop condition
+                buffer_size = sum(a.shape[0] for a in activation_buffer)
 
                 # Forward pass
                 recon, sparse, info = sae(x)
