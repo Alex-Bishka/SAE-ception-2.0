@@ -425,6 +425,26 @@ def train_sae(
                 epoch_samples += batch_size
                 global_step += 1
 
+                # W&B step-level logging (every step)
+                if wandb_run is not None:
+                    step_aux = loss_dict['sparsity_loss'].item() if 'sparsity_loss' in loss_dict else 0.0
+                    wandb_run.log({
+                        'step/loss': loss.item(),
+                        'step/recon_loss': loss_dict.get('reconstruction_loss', loss_dict['total_loss']).item(),
+                        'step/aux_loss': step_aux,
+                        'step/lr': scheduler.get_last_lr()[0],
+                        'global_step': global_step,
+                    })
+
+                # Console logging (every 50 steps)
+                if global_step % 50 == 0:
+                    current_lr = scheduler.get_last_lr()[0]
+                    step_recon = loss_dict.get('reconstruction_loss', loss_dict['total_loss']).item()
+                    logger.info(
+                        f"  Step {global_step}: loss={loss.item():.4f}, "
+                        f"recon={step_recon:.4f}, lr={current_lr:.2e}"
+                    )
+
                 # Periodic checkpoint saving
                 if global_step >= next_checkpoint_step:
                     save_checkpoint(global_step)
