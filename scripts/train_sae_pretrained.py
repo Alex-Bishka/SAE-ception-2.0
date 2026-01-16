@@ -353,7 +353,7 @@ def train_sae(
             show_progress=(epoch == 0),  # Only show progress on first epoch
         ):
             # Accumulate until we have enough for a training batch
-            activation_buffer.append(act_batch.cpu())
+            activation_buffer.append(act_batch.detach().clone().cpu())
             buffer_size = sum(a.shape[0] for a in activation_buffer)
 
             if buffer_size >= batch_size:
