@@ -332,8 +332,7 @@ def train_sae(
             batch_size=64,  # Larger batch OK with streaming (no OOM risk)
             max_length=seq_len,
             max_samples=n_sequences,
-            num_workers=0,  # <--- ADD THIS
-            pin_memory=True
+            num_workers=0
         )
 
         epoch_loss = 0
