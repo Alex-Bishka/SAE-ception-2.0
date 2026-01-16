@@ -179,14 +179,16 @@ def train_epoch_cpt(
             labels[attention_mask == 0] = -100  # Ignore padding
         
         # Forward pass with activation capture
-        with ActivationExtractor(base_model, str(layer_idx)) as extractor:
+        # NOTE: detach=False is CRITICAL - it allows aux_loss gradients to flow back
+        # through the model, which is the whole point of CPT with auxiliary loss!
+        with ActivationExtractor(base_model, str(layer_idx), detach=False) as extractor:
             outputs = model(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
                 labels=labels,
             )
-            
-            # Get activations at target layer
+
+            # Get activations at target layer (with gradients preserved)
             activations = extractor.get_activations()  # [batch, seq, hidden]
         
         # Language modeling loss (next-token prediction)
@@ -271,10 +273,11 @@ def train_cpt(
     output_path: Optional[str] = None,
     quick: bool = False,
     wandb_run=None,
+    gradient_checkpointing: bool = False,
 ):
     """
     Run CPT with SAE-ception auxiliary loss.
-    
+
     Args:
         model_name: HuggingFace model name
         sae_checkpoint: Path to pre-trained SAE
@@ -291,6 +294,9 @@ def train_cpt(
         device: Device
         output_path: Path to save trained model
         quick: Quick test mode
+        wandb_run: Weights & Biases run object (optional)
+        gradient_checkpointing: Enable gradient checkpointing to reduce memory usage
+                                (trades compute for memory, ~30% slower but much less VRAM)
     """
     if quick:
         train_samples = 1000
@@ -316,7 +322,12 @@ def train_cpt(
     
     model = AutoModelForCausalLM.from_pretrained(model_name)
     model.to(device)
-    
+
+    # Enable gradient checkpointing if requested (reduces memory, increases compute)
+    if gradient_checkpointing:
+        model.gradient_checkpointing_enable()
+        logger.info("Gradient checkpointing ENABLED (memory-efficient mode)")
+
     hidden_size = model.config.hidden_size
     logger.info(f"Hidden size: {hidden_size}")
     
@@ -535,6 +546,8 @@ def main():
     parser.add_argument('--output', type=str, default=None)
     parser.add_argument('--quick', action='store_true', help='Quick test mode')
     parser.add_argument('--device', type=str, default='cuda')
+    parser.add_argument('--gradient_checkpointing', action='store_true',
+                        help='Enable gradient checkpointing (reduces memory ~50%%, increases compute ~30%%)')
     parser.add_argument('--wandb', action='store_true', help='Enable Weights & Biases logging')
     parser.add_argument('--wandb-project', type=str, default='sae-ception', help='W&B project name')
     parser.add_argument('--wandb-run-name', type=str, default=None, help='W&B run name')
@@ -583,6 +596,7 @@ def main():
         output_path=args.output,
         quick=args.quick,
         wandb_run=wandb_run,
+        gradient_checkpointing=args.gradient_checkpointing,
     )
 
 

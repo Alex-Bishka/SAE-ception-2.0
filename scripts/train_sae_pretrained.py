@@ -17,6 +17,7 @@ Usage:
 """
 
 import argparse
+import gc
 import math
 import torch
 import torch.nn.functional as F
@@ -42,6 +43,28 @@ from sae_ception.utils.data import (
 
 logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
 logger = logging.getLogger(__name__)
+
+
+def get_memory_stats() -> Dict[str, float]:
+    """Get current memory usage statistics."""
+    stats = {}
+
+    # CPU memory (requires psutil, fallback if not available)
+    try:
+        import psutil
+        process = psutil.Process()
+        stats['cpu_ram_gb'] = process.memory_info().rss / (1024 ** 3)
+        stats['cpu_ram_pct'] = process.memory_percent()
+    except ImportError:
+        pass
+
+    # GPU memory
+    if torch.cuda.is_available():
+        stats['gpu_allocated_gb'] = torch.cuda.memory_allocated() / (1024 ** 3)
+        stats['gpu_reserved_gb'] = torch.cuda.memory_reserved() / (1024 ** 3)
+        stats['gpu_max_allocated_gb'] = torch.cuda.max_memory_allocated() / (1024 ** 3)
+
+    return stats
 
 
 def diagnose_sae(
@@ -362,10 +385,15 @@ def train_sae(
                 x = all_acts[:batch_size].to(device)
 
                 # Keep remainder in buffer
+                # IMPORTANT: .clone() breaks the memory reference to all_acts,
+                # allowing the large concatenated tensor to be garbage collected
                 if all_acts.shape[0] > batch_size:
-                    activation_buffer = [all_acts[batch_size:]]
+                    activation_buffer = [all_acts[batch_size:].clone()]
                 else:
                     activation_buffer = []
+
+                # Explicitly free the large tensor
+                del all_acts
 
                 # Forward pass
                 recon, sparse, info = sae(x)
@@ -407,6 +435,27 @@ def train_sae(
                             if n_resampled > 0:
                                 logger.info(f"  Step {global_step}: resampled {n_resampled} dead neurons")
 
+                # Periodic garbage collection to prevent memory buildup
+                if global_step % 500 == 0:
+                    gc.collect()
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+
+                    # Log memory stats periodically
+                    mem_stats = get_memory_stats()
+                    if 'cpu_ram_gb' in mem_stats:
+                        logger.info(
+                            f"  Step {global_step}: RAM={mem_stats['cpu_ram_gb']:.1f}GB "
+                            f"({mem_stats.get('cpu_ram_pct', 0):.1f}%), "
+                            f"GPU={mem_stats.get('gpu_allocated_gb', 0):.1f}GB"
+                        )
+                    if wandb_run is not None:
+                        wandb_run.log({
+                            'memory/cpu_ram_gb': mem_stats.get('cpu_ram_gb', 0),
+                            'memory/gpu_allocated_gb': mem_stats.get('gpu_allocated_gb', 0),
+                            'step': global_step,
+                        })
+
             # Early stop if we've hit target
             if epoch_samples >= n_samples:
                 break
@@ -435,6 +484,12 @@ def train_sae(
                     epoch_aux_loss += loss_dict['sparsity_loss'].item()
                 n_batches += 1
 
+
+        # End-of-epoch cleanup
+        activation_buffer = []
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
         if n_batches == 0:
             logger.warning(f"Epoch {epoch+1}: No batches processed!")

@@ -27,14 +27,16 @@ class ActivationCache:
         self.remove_hooks()
 
 
-def get_activation_hook(cache: ActivationCache, name: str) -> Callable:
+def get_activation_hook(cache: ActivationCache, name: str, detach: bool = True) -> Callable:
     """
     Create a hook function that caches activations.
-    
+
     Args:
         cache: ActivationCache to store activations in
         name: Name to store activations under
-        
+        detach: If True, detach activations from computation graph (saves memory).
+                If False, preserve gradients for backpropagation through activations.
+
     Returns:
         Hook function compatible with PyTorch's register_forward_hook
     """
@@ -43,11 +45,14 @@ def get_activation_hook(cache: ActivationCache, name: str) -> Callable:
         if isinstance(output, tuple):
             # For models that return (hidden_states, ...), take first element
             output = output[0]
-        
+
         # If output is 3D (batch, seq, hidden), we might want different handling
-        # For now, just cache as-is
-        cache.activations[name] = output.detach()
-    
+        # Optionally detach to save memory (but breaks gradient flow for aux loss)
+        if detach:
+            cache.activations[name] = output.detach()
+        else:
+            cache.activations[name] = output
+
     return hook
 
 
@@ -55,14 +60,16 @@ def register_activation_hook(
     model: nn.Module,
     layer_name: str,
     cache: ActivationCache,
+    detach: bool = True,
 ) -> None:
     """
     Register a forward hook on a specific layer.
-    
+
     Args:
         model: The model to hook
         layer_name: Name of the layer (e.g., 'transformer.h.11' or '-1' for last layer)
         cache: ActivationCache to store activations
+        detach: If True, detach activations (saves memory). If False, preserve gradients.
     """
     # Handle negative indices for layer names
     if layer_name.lstrip('-').isdigit():
@@ -100,7 +107,7 @@ def register_activation_hook(
         target_layer = dict(model.named_modules())[layer_name]
         hook_name = layer_name
     
-    hook_fn = get_activation_hook(cache, hook_name)
+    hook_fn = get_activation_hook(cache, hook_name, detach=detach)
     handle = target_layer.register_forward_hook(hook_fn)
     cache.hooks.append(handle)
 
@@ -108,17 +115,19 @@ def register_activation_hook(
 def extract_layer_output(
     model: nn.Module,
     layer_name: str,
+    detach: bool = True,
 ) -> ActivationCache:
     """
     Setup activation extraction for a specific layer.
-    
+
     Args:
         model: The model to extract from
         layer_name: Layer to extract (e.g., '-1' for last layer)
-        
+        detach: If True, detach activations (saves memory). If False, preserve gradients.
+
     Returns:
         ActivationCache that will be populated during forward passes
-        
+
     Example:
         >>> cache = extract_layer_output(model, layer_name='-1')
         >>> outputs = model(inputs)
@@ -126,27 +135,41 @@ def extract_layer_output(
         >>> cache.remove_hooks()  # Clean up when done
     """
     cache = ActivationCache()
-    register_activation_hook(model, layer_name, cache)
+    register_activation_hook(model, layer_name, cache, detach=detach)
     return cache
 
 
 class ActivationExtractor:
     """
     Context manager for extracting activations from a model.
-    
+
     Example:
         >>> with ActivationExtractor(model, 'transformer.h.11') as extractor:
         ...     outputs = model(inputs)
         ...     activations = extractor.get_activations()
+
+    For training with auxiliary loss (gradients through activations):
+        >>> with ActivationExtractor(model, 'transformer.h.11', detach=False) as extractor:
+        ...     outputs = model(inputs)
+        ...     activations = extractor.get_activations()
+        ...     aux_loss = F.mse_loss(activations, target)  # Gradients flow back!
     """
-    
-    def __init__(self, model: nn.Module, layer_name: str):
+
+    def __init__(self, model: nn.Module, layer_name: str, detach: bool = True):
+        """
+        Args:
+            model: Model to extract activations from
+            layer_name: Layer to target (e.g., 'transformer.h.11' or '11')
+            detach: If True, detach activations (saves memory, no gradients).
+                    If False, preserve gradients for backprop through activations.
+        """
         self.model = model
         self.layer_name = layer_name
+        self.detach = detach
         self.cache = None
-    
+
     def __enter__(self):
-        self.cache = extract_layer_output(self.model, self.layer_name)
+        self.cache = extract_layer_output(self.model, self.layer_name, detach=self.detach)
         return self
     
     def __exit__(self, exc_type, exc_val, exc_tb):
